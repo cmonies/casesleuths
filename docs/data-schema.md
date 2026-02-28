@@ -91,25 +91,26 @@ Suppressed persons must not appear in search results. The `public_case_people` v
 **Suppression-safe views (define in migration before any RLS policies):**
 ```sql
 -- public_people: masks suppressed persons and enforces name_display_policy
-CREATE OR REPLACE VIEW public_people AS
+CREATE OR REPLACE VIEW public_people WITH (security_barrier = true) AS
 SELECT
   p.id,
   CASE
-    WHEN se_person.id IS NOT NULL THEN '[Name withheld]'
+    WHEN se.id IS NOT NULL THEN '[Name withheld]'
     WHEN p.name_display_policy IN ('redacted', 'requires_human_review') THEN '[Name withheld]'
     WHEN p.name_display_policy = 'initials_only' THEN
       array_to_string(ARRAY(
         SELECT left(word, 1) || '.'
         FROM unnest(string_to_array(p.name, ' ')) AS word
       ), ' ')
-    WHEN p.name_display_policy IN ('auto', 'requires_human_review') THEN '[Review required]'
-    -- 'auto'/'requires_human_review': cannot safely resolve without case context or human approval
+    WHEN p.name_display_policy = 'auto' THEN '[Review required]'
+    -- 'auto': cannot safely resolve without case context; use public_case_people
+    -- 'requires_human_review' handled above as '[Name withheld]'
     ELSE p.name
   END AS display_name,
   CASE
-    WHEN se_person.id IS NOT NULL THEN NULL
+    WHEN se.id IS NOT NULL THEN NULL
     WHEN p.photo_display_policy IN ('blocked', 'requires_review') THEN NULL
-    WHEN p.name_display_policy IN ('auto', 'requires_human_review') THEN NULL -- safe: no photo without resolved name
+    WHEN p.name_display_policy IN ('auto', 'requires_human_review') THEN NULL
     ELSE p.photo_url
   END AS display_photo_url,
   p.slug,
@@ -134,7 +135,7 @@ LEFT JOIN suppressed_entities se
 -- Required for rendering "[Case removed]" pages at known URLs after takedowns.
 -- public_cases EXCLUDES suppressed cases — if a route exists, the app must check
 -- public_case_tombstones to serve a proper removal notice instead of a 404.
-CREATE OR REPLACE VIEW public_case_tombstones AS
+CREATE OR REPLACE VIEW public_case_tombstones WITH (security_barrier = true) AS
 SELECT
   c.id,
   c.slug,
@@ -153,7 +154,7 @@ WHERE c.deleted_at IS NULL;
 -- Routing logic: if slug exists in public_case_tombstones → serve 410 Gone with notice.
 
 -- public_cases: hides soft-deleted and suppressed cases from public queries
-CREATE OR REPLACE VIEW public_cases AS
+CREATE OR REPLACE VIEW public_cases WITH (security_barrier = true) AS
 SELECT c.*
 FROM cases c
 LEFT JOIN suppressed_entities se
@@ -165,31 +166,34 @@ WHERE c.deleted_at IS NULL
 All views must be created with `WITH (security_barrier = true)` to prevent predicate pushdown attacks.
 
 **Required RLS policies (migration must include these):**
+
+**Design:** anon/public clients query ONLY via views (which apply security_barrier + masking). Direct base table reads by anon are DENIED — no policies on base tables that allow anon SELECT. Service role bypasses RLS (used by agents + server-side rendering).
+
 ```sql
--- Block anon + authenticated from reading base tables directly
+-- Enable RLS on all sensitive tables — deny by default (no policy = no access)
 ALTER TABLE people ENABLE ROW LEVEL SECURITY;
 ALTER TABLE cases ENABLE ROW LEVEL SECURITY;
 ALTER TABLE case_people ENABLE ROW LEVEL SECURITY;
+ALTER TABLE suppressed_entities ENABLE ROW LEVEL SECURITY;
 
--- Anon: read-only access via views only (no direct base table access)
-CREATE POLICY "anon_read_public_cases" ON cases FOR SELECT TO anon
-  USING (review_status = 'published' AND deleted_at IS NULL
-    AND NOT EXISTS (SELECT 1 FROM suppressed_entities se
-      WHERE se.entity_type = 'cases' AND se.entity_id = id AND se.lifted_at IS NULL));
+-- NO anon SELECT policies on base tables — views handle masking
+-- Anon access is via Supabase auto-generated APIs on the views themselves,
+-- OR via server-side rendering with service_role (which bypasses RLS).
 
-CREATE POLICY "anon_read_people" ON people FOR SELECT TO anon
-  USING (name_display_policy != 'redacted'
-    AND NOT EXISTS (SELECT 1 FROM suppressed_entities se
-      WHERE se.entity_type = 'people' AND se.entity_id = id AND se.lifted_at IS NULL));
+-- Authenticated users (editors): can read their own moderation_actions, reports
+CREATE POLICY "auth_read_own_reports" ON content_reports FOR SELECT TO authenticated
+  USING (reporter_id = auth.uid());
 
-CREATE POLICY "anon_read_case_people" ON case_people FOR SELECT TO anon
-  USING (EXISTS (SELECT 1 FROM cases c WHERE c.id = case_id
-    AND c.review_status = 'published' AND c.deleted_at IS NULL));
+-- Service role: bypasses all RLS automatically (Supabase service_role key)
+-- Use service_role for: all agent writes, admin dashboard, SSR data fetching
 
--- Service role (agents, admin) bypass RLS — uses service_role key in Supabase
--- All other roles: deny by default (no policy = no access)
+-- Upvote write: authenticated users only, one per entity
+CREATE POLICY "auth_insert_upvote" ON upvotes FOR INSERT TO authenticated
+  WITH CHECK (user_id = auth.uid());
+CREATE POLICY "auth_delete_own_upvote" ON upvotes FOR DELETE TO authenticated
+  USING (user_id = auth.uid());
 ```
-Note: The above are minimum required policies. Full RLS policy set (for community features, upvotes, moderation) is written in the Supabase migration file, not this spec. Migration writer must implement complete RLS before launch.
+Note: Full RLS policy set (community features, community_notes writes, content_reports) is written in the Supabase migration file. The above is the minimum required architecture — the key rule is NO direct anon access to base tables.
 
 **`public_people` is ADMIN/EDITORIAL USE ONLY — not for public pages.** It returns `'[Review required]'` for `auto` policy persons, which would create confusing UX if used on public-facing routes. Public search, Typesense indexing, and all user-visible pages MUST use `public_case_people` (case-scoped view below). `public_people` is safe for admin dashboards and editorial review tools only.
 
@@ -198,13 +202,13 @@ Note: The above are minimum required policies. Full RLS policy set (for communit
 ```sql
 -- public_case_people: case-scoped person view that resolves 'auto' name_display_policy
 -- Use for Typesense indexing and any query that renders person names in case context
-CREATE OR REPLACE VIEW public_case_people AS
+CREATE OR REPLACE VIEW public_case_people WITH (security_barrier = true) AS
 SELECT
   cp.id AS case_person_id,
   cp.case_id,
   p.id AS person_id,
   CASE
-    WHEN se.id IS NOT NULL THEN '[Name withheld]'
+    WHEN se_person.id IS NOT NULL THEN '[Name withheld]'
     WHEN p.name_display_policy IN ('redacted', 'requires_human_review') THEN '[Name withheld]'
     WHEN p.name_display_policy = 'initials_only' THEN
       array_to_string(ARRAY(
@@ -213,25 +217,25 @@ SELECT
       ), ' ')
     WHEN p.name_display_policy = 'auto' THEN
       CASE
-        -- Auto rules: suppress if minor currently and not charged as adult
-        WHEN p.is_minor_currently = true
-             AND cp.legal_status NOT IN ('convicted') THEN '[Name withheld]'
-        -- Auto: minor charged as adult → full name allowed
+        -- 1. Minor charged as adult → full name allowed (check FIRST — overrides other minor rules)
         WHEN p.is_minor_at_time_of_crime = true AND cp.charged_as_adult = true THEN p.name
-        -- Auto: minor at time + POI/no charges → initials only
+        -- 2. Currently a minor and not convicted → withhold name
+        WHEN p.is_minor_currently = true
+             AND (cp.legal_status IS NULL OR cp.legal_status NOT IN ('convicted')) THEN '[Name withheld]'
+        -- 3. Minor at time + POI/no charges/witness → initials only
         WHEN p.is_minor_at_time_of_crime = true
              AND (cp.legal_status IN ('person_of_interest','no_charges_filed') OR cp.case_role = 'witness') THEN
           array_to_string(ARRAY(
             SELECT left(word, 1) || '.'
             FROM unnest(string_to_array(p.name, ' ')) AS word
           ), ' ')
-        -- Auto: fallthrough (adult, living, etc.) → full name
+        -- 4. Fallthrough (adult, living with disclaimer, deceased, etc.) → full name
         ELSE p.name
       END
     ELSE p.name
   END AS display_name,
   CASE
-    WHEN se.id IS NOT NULL THEN NULL
+    WHEN se_person.id IS NOT NULL THEN NULL
     WHEN p.photo_display_policy IN ('blocked', 'requires_review') THEN NULL
     WHEN p.name_display_policy IN ('redacted', 'requires_human_review') THEN NULL
     -- Block photo whenever name is being withheld by auto-policy (minor protection)
@@ -264,7 +268,7 @@ LEFT JOIN suppressed_entities se_case
   ON se_case.entity_type = 'cases' AND se_case.entity_id = c.id AND se_case.lifted_at IS NULL
 WHERE se_case.id IS NULL; -- exclude suppressed cases entirely
 ```
-Note: the `se` variable in the CASE statement above refers to `se_person`. Update the view definition to use `se_person` instead of `se` for clarity in the migration SQL.
+
 
 **Indexing rule:** Typesense jobs use `public_case_people` for person name resolution in search. `public_people` is for admin/editorial UIs that need the full person record without case context.
 
