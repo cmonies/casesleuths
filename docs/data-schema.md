@@ -43,7 +43,7 @@ _v0.16 · 2026-02-28 — P0 fixes: added qa_review→legal_review transition, fi
 - Tag / listing pages: `revalidate: 1800` (30 min)
 - Person / agency pages: `revalidate: 3600` (1 hour)
 
-**Revalidation implementation:** Supabase DB webhooks → Next.js `/api/revalidate?secret=TOKEN&path=/cases/[slug]`. Webhooks required on: `cases`, `timeline_events`, `case_people`, `evidence`, `interviews`, `case_faqs`, `podcast_episodes`, `tv_shows`, `news_articles`, `case_subreddits`, `case_tags`, `related_cases`, `charges`, `appeals`, `case_agencies`, `books`, `case_books`, `jurisdictions`, `case_series`, `case_series_members`.
+**Revalidation implementation:** Supabase DB webhooks → Next.js `/api/revalidate?secret=TOKEN&path=/cases/[slug]`. Webhooks required on: `cases`, `timeline_events`, `case_people`, `evidence`, `interviews`, `case_faqs`, `podcast_episodes`, `tv_shows`, `news_articles`, `case_subreddits`, `case_tags`, `related_cases`, `charges`, `appeals`, `case_agencies`, `books`, `case_books`, `jurisdictions`, `case_series`, `case_series_members`, `suppressed_entities` (suppressing a person or case must trigger immediate ISR revalidation — content must not remain visible after suppression).
 
 ---
 
@@ -103,10 +103,10 @@ SELECT
         FROM unnest(string_to_array(p.name, ' ')) AS word
       ), ' ')
     WHEN p.name_display_policy = 'auto' THEN '[Review required]'
-    -- 'auto': cannot safely resolve without case context; use public_case_people
-    -- 'requires_human_review' handled above as '[Name withheld]'
+    -- 'auto': cannot safely resolve without case context; use public_case_people instead
+    -- Note: 'requires_human_review' is already caught by the IN('redacted','requires_human_review') branch above
     ELSE p.name
-  END AS display_name,
+  END AS display_name, -- Note: public_people is admin-only; fail-open here is acceptable
   CASE
     WHEN se.id IS NOT NULL THEN NULL
     WHEN p.photo_display_policy IN ('blocked', 'requires_review') THEN NULL
@@ -217,22 +217,36 @@ SELECT
       ), ' ')
     WHEN p.name_display_policy = 'auto' THEN
       CASE
-        -- 1. Minor charged as adult → full name allowed (check FIRST — overrides other minor rules)
+        -- 1. Minor charged as adult → full name (check FIRST — overrides all other minor rules)
         WHEN p.is_minor_at_time_of_crime = true AND cp.charged_as_adult = true THEN p.name
-        -- 2. Currently a minor and not convicted → withhold name
+        -- 2. Currently a minor and not convicted/acquitted/exonerated → withhold name
         WHEN p.is_minor_currently = true
-             AND (cp.legal_status IS NULL OR cp.legal_status NOT IN ('convicted')) THEN '[Name withheld]'
-        -- 3. Minor at time + POI/no charges/witness → initials only
-        WHEN p.is_minor_at_time_of_crime = true
-             AND (cp.legal_status IN ('person_of_interest','no_charges_filed') OR cp.case_role = 'witness') THEN
+             AND (cp.legal_status IS NULL OR cp.legal_status NOT IN ('convicted','acquitted','exonerated'))
+             THEN '[Name withheld]'
+        -- 3. Minor at time + formally charged (alleged) but NOT as adult → initials only
+        WHEN p.is_minor_at_time_of_crime = true AND cp.legal_status = 'alleged' THEN
           array_to_string(ARRAY(
             SELECT left(word, 1) || '.'
             FROM unnest(string_to_array(p.name, ' ')) AS word
           ), ' ')
-        -- 4. Fallthrough (adult, living with disclaimer, deceased, etc.) → full name
+        -- 4. Minor at time + POI/no charges/witness → initials only
+        WHEN p.is_minor_at_time_of_crime = true
+             AND (cp.legal_status IN ('person_of_interest','no_charges_filed') OR cp.case_role = 'witness')
+             THEN
+          array_to_string(ARRAY(
+            SELECT left(word, 1) || '.'
+            FROM unnest(string_to_array(p.name, ' ')) AS word
+          ), ' ')
+        -- 5. Aged-out minor (was minor at time, now adult, still living) → human review required
+        WHEN p.is_minor_at_time_of_crime = true
+             AND p.is_minor_currently = false
+             AND p.is_living = true
+             THEN '[Review required]'
+        -- 6. Fallthrough (adult, deceased, etc.) → full name
         ELSE p.name
       END
-    ELSE p.name
+    -- Fail-closed: unknown policy values → withhold (never fail-open on a privacy-critical view)
+    ELSE '[Name withheld]' 
   END AS display_name,
   CASE
     WHEN se_person.id IS NOT NULL THEN NULL
@@ -453,6 +467,9 @@ BEGIN
       JOIN people p ON p.id = cp.person_id
       WHERE cp.case_id = NEW.id
         AND p.is_living = true
+        -- Exclude pure functional roles — detectives/attorneys/judges/witnesses have no legal standing
+        -- Victims (case_role='victim') with NULL legal_status ARE checked (could be defamatory)
+        AND cp.case_role NOT IN ('detective', 'attorney', 'judge', 'witness')
         AND (cp.legal_status IS NULL OR cp.legal_status NOT IN ('convicted','acquitted','exonerated'))
     ) AND (NEW.disclaimer IS NULL OR trim(NEW.disclaimer) = '') THEN
       RAISE EXCEPTION
@@ -633,7 +650,9 @@ ALTER TABLE entity_sources ADD CONSTRAINT entity_sources_entity_type_check
 
 -- people.is_living consistency with dod — applied on CREATE TABLE people
 ALTER TABLE people ADD CONSTRAINT people_is_living_dod_check
-  CHECK (dod IS NULL OR is_living IS NOT TRUE);
+  CHECK (dod IS NULL OR is_living = false);
+  -- IS NOT TRUE would allow NULL (unknown living status) with a dod set, which is contradictory.
+  -- is_living = false is the correct constraint: person with dod must be marked not-living.
 ```
 
 ---
@@ -842,7 +861,7 @@ Query pattern: `WHERE case_id_a = X OR case_id_b = X`.
 | `dod` | date | nullable |
 | `bio` | text | |
 | `photo_url` | text | |
-| `is_living` | bool | nullable — null = unknown. `true` + not convicted → aggressive disclaimer required. CHECK: `(dod IS NULL OR is_living IS NOT TRUE)` — person cannot have a date of death and be marked living. |
+| `is_living` | bool | nullable — null = unknown. `true` + not convicted → aggressive disclaimer required. CHECK: `(dod IS NULL OR is_living = false)` — person cannot have a date of death and be marked living. |
 | `is_minor_at_time_of_crime` | bool | nullable — under 18 when the crime occurred |
 | `is_minor_currently` | bool | nullable — still a minor today. **Auto-update mechanism:** Agent D nightly cron detects when `is_minor_currently = true` persons turn 18. On detection, Agent D does NOT auto-flip the flag. Instead: (1) Agent D sets `name_display_policy = 'requires_human_review'` (sentinel value — prevents display), (2) logs a `moderation_actions` record (`action_type: 'flagged'`, `agent_source: 'agent_d'`, `metadata: { "reason": "minor_aged_out", "dob": "...", "age": 18 }`), (3) alerts Carmen directly. Carmen reviews the case and either sets `name_display_policy = 'full'` (clear for display) or `name_display_policy = 'redacted'` (keep protected). Only after Carmen acts does `is_minor_currently` get set to false. **No auto-flip without human review.** Add `'requires_human_review'` to `name_display_policy` enum. The `public_case_people` view treats `requires_human_review` as `'[Review required]'` (same as auto sentinel). |
 | `name_display_policy` | enum | `full` · `initials_only` · `redacted` · `auto` · `requires_human_review` — default `auto`. `auto` = system resolves based on minor flags + case role. `requires_human_review` = sentinel set by Agent D when a minor ages out — blocks display until human clears it. |
@@ -1279,7 +1298,7 @@ PK: `(case_id, book_id)`
 
 PK: `(user_id, entity_type, entity_id)` — naturally prevents double-upvotes.
 
-CONSTRAINT: `CHECK (entity_type IN ('community_notes'))` — **MVP scope: only `community_notes` are upvotable.** Do not use the dynamic trigger for any other entity type until this CHECK is extended. The CHECK and the trigger scope MUST stay in sync — adding a table to the trigger without adding to this CHECK causes immediate write failures (no rows can be inserted). Extension procedure: (1) add `upvote_count int NOT NULL DEFAULT 0 CHECK (upvote_count >= 0)` to the new table, (2) add the new entity_type to this CHECK (migration required), (3) add a nightly reconciliation query to `docs/data-pipeline.md`.
+CONSTRAINT: `CHECK (entity_type IN ('community_notes'))` — **MVP scope: only `community_notes` are upvotable.** Tables with `upvote_count int NOT NULL DEFAULT 0 CHECK (upvote_count >= 0)` in v1: `community_notes` only. Future candidates: `community_corrections`, `evidence`, `sources` — extend this CHECK + add the column when ready. Do not use the dynamic trigger for any other entity type until this CHECK is extended. The CHECK and the trigger scope MUST stay in sync — adding a table to the trigger without adding to this CHECK causes immediate write failures (no rows can be inserted). Extension procedure: (1) add `upvote_count int NOT NULL DEFAULT 0 CHECK (upvote_count >= 0)` to the new table, (2) add the new entity_type to this CHECK (migration required), (3) add a nightly reconciliation query to `docs/data-pipeline.md`.
 
 ### `community_notes`
 
