@@ -1,6 +1,6 @@
 # CaseSleuths — Data Schema
 
-_v0.6 · 2026-02-28 — GPT-5.2 structural additions (charges, appeals, sources, jurisdictions, case series, books, moderation actions), minor/privacy policy fields, takedown/suppression tables, SEO fields, upvote hardening notes, timeline event_type enum_
+_v0.7 · 2026-02-28 — Added `cases.review_status` pipeline enum + `docs/data-pipeline.md` (4-agent seeding/review/audit process); also v0.6 P0 fixes: resolved upvote_count contradiction, added Enum Definitions section, fixed suppressed_entities partial UNIQUE, fixed slug_redirects FK to cases.id, added cases.deleted_at soft-delete, added CHECK constraints on content_warnings/primary_weapon/entity_sources, added UNIQUE(case_id,person_id) to case_people, fixed "CaseLog" → "CaseSleuths" in legal framework, added 6 missing indexes, documented all FK cascade policies_
 
 ---
 
@@ -157,6 +157,64 @@ See `docs/legal-safety-framework.md` for full policy. Key constraints:
 
 ---
 
+### Enum Definitions
+
+> All enums must be created with `CREATE TYPE ... AS ENUM (...)` before any table that references them. Supabase migration order: enums → tables → FKs → triggers → RLS policies → indexes.
+
+| Enum name | Values |
+|-----------|--------|
+| `case_status` | `unsolved` · `solved_convicted` · `solved_acquitted` · `solved_exonerated` · `ongoing_trial` · `cold_case` · `civil_resolution` · `closed_no_crime` · `closed_suspect_deceased` |
+| `legal_sensitivity` | `standard` · `elevated` · `high` |
+| `review_status` | `draft` · `legal_review` · `qa_review` · `approved` · `published` · `rejected` · `suppressed` |
+| `person_legal_status` | `victim` · `alleged` · `convicted` · `acquitted` · `exonerated` · `person_of_interest` · `no_charges_filed` · `witness` · `detective` · `attorney` · `judge` · `other` |
+| `name_display_policy` | `full` · `initials_only` · `redacted` · `auto` |
+| `photo_display_policy` | `allowed` · `blocked` · `requires_review` |
+| `app_role` | `user` · `moderator` · `admin` |
+| `event_type` | `crime_event` · `discovery` · `arrest` · `indictment` · `trial_start` · `verdict` · `sentencing` · `appeal_filed` · `appeal_ruling` · `release` · `death` · `media_coverage` · `other` |
+| `date_precision` | `exact` · `approximate` · `year_only` |
+| `evidence_type` | `photo` · `audio` · `document` · `video` · `physical` · `other` |
+| `interview_type` | `police` · `media` · `court` · `documentary` |
+| `tv_show_type` | `documentary` · `docu_series` · `drama` · `news_special` |
+| `media_source` | `rss` · `manual` |
+| `news_source` | `manual` · `rss` · `google_news` |
+| `relevance` | `primary` · `mentions` |
+| `media_type` | `podcast_episode` · `tv_show` |
+| `media_progress_status` | `completed` · `in_progress` · `want_to_consume` |
+| `correction_status` | `pending` · `accepted` · `rejected` |
+| `report_reason` | `inaccurate` · `inappropriate` · `spam` · `copyright` · `other` |
+| `report_status` | `pending` · `reviewed` · `resolved` |
+| `charge_disposition` | `pending` · `dismissed` · `convicted` · `acquitted` · `plea_deal` · `mistrial` · `charges_dropped` |
+| `appeal_type` | `direct_appeal` · `habeas_corpus` · `post_conviction_relief` · `civil` |
+| `appeal_status` | `pending` · `granted` · `denied` · `withdrawn` |
+| `source_type` | `court_document` · `news_article` · `official_statement` · `book` · `documentary` · `podcast_episode` · `other` |
+| `claim_type` | `allegation` · `court_finding` · `media_report` · `official_statement` |
+| `jurisdiction_type` | `federal` · `state` · `county` · `city` · `international` |
+| `takedown_request_type` | `legal_demand` · `family_request` · `subject_request` · `minor_aged_out` · `victim_privacy` · `court_order` · `dmca` |
+| `takedown_status` | `received` · `under_review` · `complied` · `partially_complied` · `denied` · `escalated` |
+| `suppression_reason` | `legal_demand` · `court_order` · `minor_privacy` · `victim_request` · `family_request` · `editorial` |
+| `moderation_action_type` | `approved` · `rejected` · `edited` · `deleted` · `restored` · `suppressed` · `unsuppressed` · `locked` · `unlocked` |
+| `agency_type` | `local_pd` · `sheriff` · `fbi` · `da` · `state_police` · `other` |
+
+**Controlled text fields** (stored as `text` or `text[]` with CHECK constraints, not enums):
+
+```sql
+-- content_warnings array
+CHECK (content_warnings <@ ARRAY['child_victim','sexual_violence','infant_victim',
+  'family_violence','mass_casualty','graphic_imagery_risk']::text[])
+
+-- primary_weapon
+CHECK (primary_weapon IN ('firearm','knife','blunt_object','poison',
+  'strangulation','unknown','other'))
+
+-- entity_sources.entity_type
+CHECK (entity_type IN ('cases','people','timeline_events','evidence','charges','appeals'))
+
+-- is_living consistency with dod
+CHECK (dod IS NULL OR is_living IS NOT TRUE)
+```
+
+---
+
 ### Rendering
 - `cases.body` uses plain **Markdown**, not MDX. Rendered with `react-markdown`.
 
@@ -254,7 +312,9 @@ Case
 | `og_image_url` | text | 1200×630 for Open Graph |
 | `number_of_victims` | int | nullable — for programmatic SEO stats pages |
 | `primary_weapon` | text | nullable — controlled: `firearm` · `knife` · `blunt_object` · `poison` · `strangulation` · `unknown` · `other` |
-| `published_at` | timestamptz | null = draft. Never auto-set for `legal_sensitivity: high` |
+| `review_status` | enum | `draft` · `legal_review` · `qa_review` · `approved` · `published` · `rejected` · `suppressed` — pipeline gate, see `docs/data-pipeline.md` |
+| `published_at` | timestamptz | null = draft. Never auto-set for `legal_sensitivity: high`. Must be accompanied by `review_status: published`. |
+| `deleted_at` | timestamptz | Soft delete. Cases are NEVER hard-deleted — destroys audit trail. Set `deleted_at` instead. RLS hides from all public queries. |
 | `created_at` | timestamptz | |
 | `updated_at` | timestamptz | |
 
@@ -266,7 +326,8 @@ Case
 |-------|------|-------|
 | `id` | uuid | PK |
 | `old_slug` | text | UNIQUE |
-| `new_slug` | text | FK → cases.slug ON DELETE CASCADE ON UPDATE CASCADE — cascades handle A→B→C chains automatically |
+| `new_case_id` | uuid | FK → cases.id (ON DELETE CASCADE) — canonical reference, immune to slug changes |
+| `new_slug` | text | Denormalized cache of the current slug — maintained by trigger, never set manually |
 | `created_at` | timestamptz | |
 | `updated_at` | timestamptz | |
 
@@ -380,6 +441,11 @@ Surrogate PK supports multi-role per case (e.g. initially `witness`, later `alle
 | `updated_at` | timestamptz | |
 
 UNIQUE: `(case_id, person_id, legal_status)` — prevents exact duplicate role rows per case.
+UNIQUE: `(case_id, person_id)` — **also required** as a non-partial unique constraint so `charges` can hold a composite FK referencing `(case_id, person_id)` — ensuring no charge can exist for a person not linked to the case. Note: this means only one "primary" row per person per case when using the composite FK; the surrogate PK still allows multi-role rows via the `legal_status` uniqueness above.
+
+**FK cascade policies:**
+- `case_people.case_id` → CASCADE
+- `case_people.person_id` → RESTRICT
 
 ---
 
@@ -682,7 +748,7 @@ Links sources to any entity (case, person, timeline event, evidence, etc.) with 
 | Field | Type | Notes |
 |-------|------|-------|
 | `source_id` | uuid | FK → sources (ON DELETE CASCADE) |
-| `entity_type` | text | Table name — `cases` · `people` · `timeline_events` · `evidence` · etc. |
+| `entity_type` | text | CHECK: `IN ('cases','people','timeline_events','evidence','charges','appeals')` |
 | `entity_id` | uuid | |
 | `claim_type` | enum | `allegation` · `court_finding` · `media_report` · `official_statement` — prevents editors from implying guilt |
 | `notes` | text | nullable |
@@ -772,7 +838,7 @@ CONSTRAINT: `CHECK (entity_type IN ('community_notes'))` — extend this list as
 | `body` | text | |
 | `upvote_count` | int | NOT NULL DEFAULT 0 — trigger-maintained |
 | `is_pinned` | bool | |
-| `deleted_at` | timestamptz | Soft delete. UI shows "[removed]". Triggers zero `upvote_count`. RLS blocks new upvotes. |
+| `deleted_at` | timestamptz | Soft delete. UI shows "[removed]". RLS blocks new upvotes (`WHERE deleted_at IS NULL`). `upvote_count` is preserved — not zeroed — so restored notes recover their signal. |
 | `created_at` | timestamptz | |
 | `updated_at` | timestamptz | |
 
@@ -857,7 +923,7 @@ Kill switch. Suppressed person → renders as "[Name withheld]" site-wide. Suppr
 | `lift_reason` | text | nullable |
 | `created_at` | timestamptz | |
 
-UNIQUE: `(entity_type, entity_id)` — one active suppression record per entity. No `updated_at` — immutable; use `lifted_at` to record reversal.
+PARTIAL UNIQUE INDEX: `CREATE UNIQUE INDEX ON suppressed_entities (entity_type, entity_id) WHERE lifted_at IS NULL` — allows re-suppression after a suppression has been lifted. No full `UNIQUE` constraint (would block INSERT after lift). No `updated_at` — immutable; use `lifted_at` to record reversal.
 
 ### `moderation_actions`
 
@@ -955,6 +1021,14 @@ PK: `(user_id, media_type, media_id)`
 | `suppressed_entities` | `(entity_type, entity_id)` | UNIQUE | Kill switch lookup |
 | `moderation_actions` | `(entity_type, entity_id)` | btree | Audit trail per entity |
 | `moderation_actions` | `moderator_id` | btree | Actions per moderator |
+| `case_agencies` | `agency_id` | btree | "Cases per agency" reverse lookup |
+| `charges` | `jurisdiction_id` | btree | FK join |
+| `appeals` | `charge_id` | btree | FK join |
+| `community_corrections` | `user_id` | btree | "My corrections" page |
+| `content_reports` | `(entity_type, entity_id)` | btree | Reports on a specific entity |
+| `case_reddit_posts` | `subreddit_id` | btree | Posts grouped by subreddit |
+| `cases` | `review_status` | btree | Pipeline admin queue |
+| `cases` | `deleted_at` | partial (`WHERE deleted_at IS NULL`) | Filter soft-deleted cases |
 
 ---
 

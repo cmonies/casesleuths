@@ -1,4 +1,4 @@
-# CaseLog — Legal & Safety Framework
+# CaseSleuths — Legal & Safety Framework
 _Last updated: 2026-02-26_
 _Status: Draft — review with a lawyer before launch_
 
@@ -6,7 +6,7 @@ _Status: Draft — review with a lawyer before launch_
 
 ## Overview
 
-True crime is a uniquely sensitive content category. Unlike most apps, CaseLog touches:
+True crime is a uniquely sensitive content category. Unlike most apps, CaseSleuths touches:
 - Living people accused of crimes (not always convicted)
 - Victims and their families, who may not want coverage
 - Ongoing investigations and trials
@@ -20,7 +20,7 @@ Getting this wrong isn't just a PR problem — it's a **defamation liability** a
 ## 1. Defamation Risk
 
 ### The Core Risk
-CaseLog aggregates and surfaces claims about real people. If we label a living person a "killer" or "suspect" and they were acquitted, never charged, or wrongfully convicted — that's defamation exposure.
+CaseSleuths aggregates and surfaces claims about real people. If we label a living person a "killer" or "suspect" and they were acquitted, never charged, or wrongfully convicted — that's defamation exposure.
 
 ### High-Risk Scenarios
 - **Acquitted suspects** — if our UI implies guilt, that's actionable
@@ -114,7 +114,7 @@ Users must be able to **filter out content warning categories** from browse/disc
 ### Jurisdictions That Matter
 - **GDPR (EU/UK):** User data, right to erasure, explicit consent. If we have EU users, we need a privacy policy, cookie consent, and a data deletion mechanism.
 - **CCPA (California):** Right to know, opt out of data selling (we don't sell data, but must state so). Required for California users — which is basically everyone.
-- **Children's privacy (COPPA, US):** CaseLog is not for users under 13 (content is adult). Must have age gate at signup.
+- **Children's privacy (COPPA, US):** CaseSleuths is not for users under 13 (content is adult). Must have age gate at signup.
 
 ### Required at Launch
 - Privacy policy (covers: what we collect, how we use it, your rights, deletion)
@@ -186,7 +186,7 @@ Key provisions to include (work with a lawyer for actual drafting):
 
 1. **Age requirement:** Users must be 18+ (recommended over 13+, given content)
 2. **Content disclaimer:** Case information is for educational/entertainment purposes. We are not law enforcement. Do not use this information to contact or approach anyone.
-3. **No harassment:** Using CaseLog to identify, locate, or contact victims, suspects, or their families is a permanent ban offense.
+3. **No harassment:** Using CaseSleuths to identify, locate, or contact victims, suspects, or their families is a permanent ban offense.
 4. **No doxxing:** Posting personal information about real people is prohibited.
 5. **No speculation as fact:** Community contributions may not present theories as established fact.
 6. **Liability limitation:** We are not liable for inaccurate case information; this is a curated index, not legal record.
@@ -234,13 +234,13 @@ Key provisions to include (work with a lawyer for actual drafting):
 
 **Letterboxd (our model for the product):**
 - No review moderation for film critiques (films aren't people with legal status)
-- CaseLog is different — our "films" are real people and real crimes. Letterboxd's moderation model doesn't apply here.
+- CaseSleuths is different — our "films" are real people and real crimes. Letterboxd's moderation model doesn't apply here.
 
 ---
 
 ## 10. Unsolved Cases with Living Named Suspects — Special Handling
 
-This is the highest-risk category for CaseLog. An unsolved case where a living person has been named (by media, podcasts, or community speculation) as a suspect requires extra gates before publication.
+This is the highest-risk category for CaseSleuths. An unsolved case where a living person has been named (by media, podcasts, or community speculation) as a suspect requires extra gates before publication.
 
 ### Policy
 - **No auto-publish** for case pages in this category. Human review required before the case goes live.
@@ -258,7 +258,7 @@ Showing good faith in responding to these requests matters enormously in any fut
 ### Precedent: Reddit/Boston Marathon Bombing (2013)
 Reddit's r/findbostonbombers misidentified Sunil Tripathi (a missing Brown student) as a bombing suspect. His family learned their missing son was being publicly named as a terrorist from news coverage. He had already died. Reddit issued a formal apology. The *New York Post* — which published a front page with photos of two innocent men — settled a defamation lawsuit for an undisclosed sum. Section 230 protected Reddit as a platform; it did not protect the Post, which created and published the content.
 
-CaseLog, as a curator and organizer of podcast content, sits closer to the Post end than the Reddit end when it comes to case pages we write and maintain.
+CaseSleuths, as a curator and organizer of podcast content, sits closer to the Post end than the Reddit end when it comes to case pages we write and maintain.
 
 ---
 
