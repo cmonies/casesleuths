@@ -41,6 +41,8 @@ Every case and every person in the case must carry a legal status label. This is
 - `ongoing_trial` — active criminal proceedings
 - `cold_case` — officially inactive, no resolution
 - `civil_resolution` — no criminal conviction but civil judgment (e.g., O.J. Simpson)
+- `closed_no_crime` — ruled accidental, suicide, or natural causes (e.g., Elisa Lam)
+- `closed_suspect_deceased` — primary suspect died before trial or charges (e.g., Gabby Petito case)
 
 **Person status (within a case):**
 - `victim`
@@ -48,9 +50,7 @@ Every case and every person in the case must carry a legal status label. This is
 - `acquitted`
 - `exonerated`
 - `alleged` (charged but not convicted)
-- `person_of_interest` (named by investigators, not charged)
--  — named by investigators, not formally charged
-- If truly unnamed (no identity known), omit from person records entirely
+- `person_of_interest` (named by investigators, not formally charged — if truly unnamed, omit from person records)
 - `witness`
 - `no_charges_filed` (named in media/podcasts, never charged)
 

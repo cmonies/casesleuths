@@ -1,6 +1,6 @@
 # CaseSleuths — Data Schema
 
-_v0.4 · 2026-02-27 — All P0–P3 round 3 fixes: legal vocab, missing indexes, status enum, triggers, FK policy, soft delete policy_
+_v0.5 · 2026-02-27 — Round 4 fixes: legal framework doc sync, FK annotations on all join tables, tv_shows cascade fix, upvotes CHECK constraint, parent_id index_
 
 ---
 
@@ -237,10 +237,10 @@ Case
 
 ### `case_tags` (pure join — no timestamps)
 
-| Field | Type |
-|-------|------|
-| `case_id` | uuid |
-| `tag_id` | uuid |
+| Field | Type | Notes |
+|-------|------|-------|
+| `case_id` | uuid | FK → cases (ON DELETE CASCADE) |
+| `tag_id` | uuid | FK → tags (ON DELETE CASCADE) |
 
 PK: `(case_id, tag_id)`
 
@@ -250,8 +250,8 @@ PK: `(case_id, tag_id)`
 
 | Field | Type | Notes |
 |-------|------|-------|
-| `case_id_a` | uuid | |
-| `case_id_b` | uuid | |
+| `case_id_a` | uuid | FK → cases (ON DELETE CASCADE) |
+| `case_id_b` | uuid | FK → cases (ON DELETE CASCADE) |
 | `relationship_type` | text | e.g. `same_alleged_person` · `same_jurisdiction` · `connected_victim` · `linked_investigation` |
 | `notes` | text | |
 
@@ -474,7 +474,7 @@ PK: `(case_id, episode_id)`
 | Field | Type | Notes |
 |-------|------|-------|
 | `case_id` | uuid | FK → cases (CASCADE) |
-| `show_id` | uuid | FK → tv_shows (RESTRICT) |
+| `show_id` | uuid | FK → tv_shows (ON DELETE CASCADE) |
 | `episode_refs` | jsonb | Array of `{ "season": 2, "episode": 5 }` |
 | `notes` | text | |
 
@@ -499,10 +499,10 @@ PK: `(case_id, show_id)`
 
 ### `case_news_articles` (pure join — no timestamps)
 
-| Field | Type |
-|-------|------|
-| `case_id` | uuid |
-| `article_id` | uuid |
+| Field | Type | Notes |
+|-------|------|-------|
+| `case_id` | uuid | FK → cases (ON DELETE CASCADE) |
+| `article_id` | uuid | FK → news_articles (ON DELETE CASCADE) |
 
 PK: `(case_id, article_id)`
 
@@ -563,6 +563,8 @@ Retention: keep top 50 posts per case by score. Upsert on `post_id` UNIQUE on ea
 | `created_at` | timestamptz | |
 
 PK: `(user_id, entity_type, entity_id)` — naturally prevents double-upvotes.
+
+CONSTRAINT: `CHECK (entity_type IN ('community_notes'))` — extend this list as more entities become upvotable. Prevents trigger runtime errors from bad entity_type values.
 
 ### `community_notes`
 
@@ -655,6 +657,7 @@ PK: `(user_id, media_type, media_id)`
 | `community_notes` | `case_id` | btree | Load notes per case |
 | `community_notes` | `user_id` | btree | "My notes" page |
 | `community_notes` | `deleted_at` | partial (`WHERE deleted_at IS NULL`) | Filter soft-deleted |
+| `community_notes` | `parent_id` | partial (`WHERE parent_id IS NOT NULL`) | Thread reply loading |
 | `community_corrections` | `case_id` | btree | Corrections per case |
 | `community_corrections` | `status` | btree | Admin review queue |
 | `content_reports` | `status` | btree | Admin review queue |
