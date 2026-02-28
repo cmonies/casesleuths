@@ -133,7 +133,65 @@ WHERE c.deleted_at IS NULL
   AND se.id IS NULL
   AND c.review_status = 'published';
 ```
-Note: Add `WITH (security_barrier = true)` if using Supabase RLS alongside these views for maximum safety. Typesense indexing jobs must SELECT from `public_people` and `public_cases` only.
+Note: Add `WITH (security_barrier = true)` if using Supabase RLS alongside these views for maximum safety.
+
+**`name_display_policy: auto` limitation:** `public_people` resolves `full`, `initials_only`, and `redacted` policies. It does NOT resolve `auto` — `auto` requires case context (`case_people.legal_status`) to evaluate correctly and is therefore case-scoped. Typesense indexing must use `public_case_people` (case-scoped view, defined below) for any query that might include persons with `name_display_policy = 'auto'`. Using `public_people` alone for search indexing risks indexing protected persons under their full name.
+
+```sql
+-- public_case_people: case-scoped person view that resolves 'auto' name_display_policy
+-- Use for Typesense indexing and any query that renders person names in case context
+CREATE OR REPLACE VIEW public_case_people AS
+SELECT
+  cp.id AS case_person_id,
+  cp.case_id,
+  p.id AS person_id,
+  CASE
+    WHEN se.id IS NOT NULL THEN '[Name withheld]'
+    WHEN p.name_display_policy = 'redacted' THEN '[Name withheld]'
+    WHEN p.name_display_policy = 'initials_only' THEN
+      array_to_string(ARRAY(
+        SELECT left(word, 1) || '.'
+        FROM unnest(string_to_array(p.name, ' ')) AS word
+      ), ' ')
+    WHEN p.name_display_policy = 'auto' THEN
+      CASE
+        -- Auto rules: suppress if minor currently and not charged as adult
+        WHEN p.is_minor_currently = true
+             AND cp.legal_status NOT IN ('convicted') THEN '[Name withheld]'
+        -- Auto rules: initials if minor at time and POI/no charges
+        WHEN p.is_minor_at_time_of_crime = true
+             AND cp.legal_status IN ('person_of_interest','no_charges_filed','witness') THEN
+          array_to_string(ARRAY(
+            SELECT left(word, 1) || '.'
+            FROM unnest(string_to_array(p.name, ' ')) AS word
+          ), ' ')
+        ELSE p.name
+      END
+    ELSE p.name
+  END AS display_name,
+  CASE
+    WHEN se.id IS NOT NULL THEN NULL
+    WHEN p.photo_display_policy IN ('blocked', 'requires_review') THEN NULL
+    WHEN p.name_display_policy IN ('redacted') THEN NULL
+    ELSE p.photo_url
+  END AS display_photo_url,
+  cp.legal_status,
+  cp.notes,
+  cp.is_primary,
+  p.slug,
+  p.primary_known_role,
+  p.is_living,
+  p.is_minor_at_time_of_crime,
+  p.is_minor_currently,
+  p.name_display_policy,
+  p.photo_display_policy
+FROM case_people cp
+JOIN people p ON p.id = cp.person_id
+LEFT JOIN suppressed_entities se
+  ON se.entity_type = 'people' AND se.entity_id = p.id AND se.lifted_at IS NULL;
+```
+
+**Indexing rule:** Typesense jobs use `public_case_people` for person name resolution in search. `public_people` is for admin/editorial UIs that need the full person record without case context.
 
 **Drift insurance:** Nightly reconciliation cron recomputes all `upvote_count` values from the `upvotes` table directly — cheap insurance against trigger edge cases (manual SQL, pg_restore, bulk imports).
 
@@ -168,6 +226,24 @@ BEGIN
   RETURN NULL;
 END;
 $$ LANGUAGE plpgsql;
+-- Upvote orphan cleanup: when a community_note is soft-deleted, clean up its upvotes
+-- (hard deletes on notes are rare; soft delete is the normal flow)
+-- For each upvotable entity type, create a corresponding cleanup trigger:
+CREATE OR REPLACE FUNCTION cleanup_upvotes_on_soft_delete() RETURNS TRIGGER AS $$
+BEGIN
+  IF NEW.deleted_at IS NOT NULL AND OLD.deleted_at IS NULL THEN
+    DELETE FROM upvotes
+    WHERE entity_type = TG_ARGV[0] AND entity_id = NEW.id;
+    -- Note: upvote_count on the parent is preserved (historical signal);
+    -- deleted upvote rows cannot be re-created (RLS blocks inserts when deleted_at set)
+  END IF;
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+-- Apply per upvotable table that has a deleted_at column:
+-- CREATE TRIGGER cleanup_community_note_upvotes AFTER UPDATE ON community_notes
+--   FOR EACH ROW EXECUTE FUNCTION cleanup_upvotes_on_soft_delete('community_notes');
+
 -- Note: entity_type values MUST match actual table names for dynamic dispatch.
 -- Soft-delete guard: RLS on upvotes prevents new inserts when parent deleted_at IS NOT NULL.
 -- Service-role bypass: if a service-role client inserts an upvote for a soft-deleted entity,
@@ -326,7 +402,7 @@ $$ LANGUAGE plpgsql;
 
 ### FK Cascade Policy
 
-**Default: `ON DELETE CASCADE` for all child rows** (timeline_events, case_people, evidence, etc. are deleted when their parent case is deleted). Pure join tables always cascade. **Exception:** `people` and `agencies` use `ON DELETE RESTRICT` — deleting a person or agency that appears in multiple cases requires explicit cleanup. Document any exceptions per-table where they deviate.
+**Default: `ON DELETE CASCADE` for all child rows** (timeline_events, case_people, evidence, etc. cascade when their parent case row is deleted). Pure join tables always cascade. **Exception:** `people` and `agencies` use `ON DELETE RESTRICT`. **Note on `cases` hard-delete:** the `block_case_hard_delete` trigger prevents any DELETE on the `cases` table — child cascades therefore can never fire in practice. They exist for DB integrity consistency (if the trigger were ever removed) but the operational path to removing cases is always soft-delete via `deleted_at`. |
 
 ---
 
@@ -511,11 +587,11 @@ Case
 | `content_warnings` | text[] | NOT NULL DEFAULT '{}' — Controlled list: `child_victim` · `sexual_violence` · `infant_victim` · `family_violence` · `mass_casualty` · `graphic_imagery_risk` |
 | `jurisdiction_id` | uuid | FK → jurisdictions (SET NULL) — nullable |
 | `location_city` | text | |
-| `location_state` | text | **Display field** — full state name e.g. `California`. Not used for filtering. |
-| `location_country` | text | **Display field** — full country name e.g. `United States`. Not used for filtering. |
+| `location_state` | text | **Display field** — full state name in English, title case e.g. `California`. Not used for filtering. Normalized value expected; no CHECK (too complex). |
+| `location_country` | text | **Display field** — full country name in English, title case e.g. `United States`. Not used for filtering. Use standard English country names (not native-language names). |
 | `state_code` | text | **Filter/SEO field** — 2-letter US state code e.g. `CA`. CHECK (`state_code ~ '^[A-Z]{2}$'`) when NOT NULL. Used for /state/california pages. NULL for non-US cases. |
-| `country_code` | text | NOT NULL default `US` — **Filter/SEO field** — ISO 3166-1 alpha-2 e.g. `US`, `GB`. CHECK (`country_code ~ '^[A-Z]{2}$'`). Used for international filtering. Canonical: when `country_code != 'US'`, `state_code` MUST be NULL. |
-| `location_coords` | point | lat/lng |
+| `country_code` | text | NOT NULL default `US` — **Filter/SEO field** — ISO 3166-1 alpha-2 e.g. `US`, `GB`. CHECK (`country_code ~ '^[A-Z]{2}$'`). Used for international filtering. CHECK: `(country_code = 'US' OR state_code IS NULL)` — enforces that non-US cases cannot have a `state_code` set. |
+| `location_coords` | point | Postgres `point(x, y)` where **x = longitude, y = latitude** (standard GIS convention). e.g. `point(-122.4194, 37.7749)` for San Francisco. Note: Postgres `point` is `(x,y)`, NOT `(lat,lng)` — inverted from common API conventions. |
 | `date_start` | date | |
 | `date_end` | date | nullable |
 | `year` | int | **Trigger-maintained** (not GENERATED ALWAYS AS — Supabase doesn't support it reliably). The `sync_case_year` trigger unconditionally sets `year = EXTRACT(YEAR FROM date_start)` on every INSERT and UPDATE where `date_start IS NOT NULL`. If `date_start IS NULL`, `year` remains NULL. **Manual year overrides are not supported** — to set a custom year, you must set `date_start` accordingly or patch via a direct admin UPDATE that bypasses the trigger (service role only, log in `moderation_actions`). Nullable — cold cases without a known date have `year = NULL`. Used for /year/1994 SEO pages. |
@@ -544,7 +620,7 @@ Case
 | `id` | uuid | PK |
 | `old_slug` | text | UNIQUE |
 | `new_case_id` | uuid | FK → cases.id (ON DELETE CASCADE) — canonical reference, immune to slug changes |
-| `new_slug` | text | Denormalized cache of the current slug — maintained by trigger, never set manually |
+| `new_slug` | text | NOT NULL — denormalized cache of the current `cases.slug`. **Initialization:** on INSERT into `slug_redirects`, application layer must set `new_slug = (SELECT slug FROM cases WHERE id = new_case_id)`. The `sync_slug_redirect` trigger only fires on `cases.slug` UPDATE — it does not initialize `new_slug` on row creation. Supabase function or app-layer helper required for INSERT. |
 | `created_at` | timestamptz | |
 | `updated_at` | timestamptz | |
 
@@ -578,7 +654,7 @@ PK: `(case_id, tag_id)`
 |-------|------|-------|
 | `case_id_a` | uuid | FK → cases (ON DELETE CASCADE) |
 | `case_id_b` | uuid | FK → cases (ON DELETE CASCADE) |
-| `relationship_type` | text | **Intentionally free-form** — not a CHECK/enum. Common values: `same_alleged_person` · `same_jurisdiction` · `connected_victim` · `linked_investigation` · `same_series` · `cold_case_reopened`. Free-form allows novel relationship types without a migration. Typesense indexes this field for filtering; document new values in `docs/taxonomy.md` (to be created) when introduced. |
+| `relationship_type` | text | **Intentionally free-form** — not a CHECK/enum. **Canonicalization rule: lowercase snake_case only.** CHECK (`relationship_type ~ '^[a-z_]+$'`). Common values: `same_alleged_person` · `same_jurisdiction` · `connected_victim` · `linked_investigation` · `same_series` · `cold_case_reopened`. Free-form allows novel relationship types without a migration, but the snake_case CHECK prevents drift. Document new values in `docs/taxonomy.md` (to be created) when introduced. |
 | `notes` | text | |
 
 PK: `(case_id_a, case_id_b)`
@@ -607,7 +683,7 @@ CONSTRAINT: `CHECK (case_id_a < case_id_b)` — prevents `(A,B)` and `(B,A)` dup
 | `id` | uuid | PK |
 | `case_id` | uuid | FK → cases (ON DELETE CASCADE) |
 | `date` | date | |
-| `date_precision` | enum | NOT NULL DEFAULT `approximate` — `exact` · `approximate` · `year_only`. CHECK (implied by NOT NULL): if `date IS NULL` then `date_precision` should be `approximate` (unknown date). Agent A must always set this field. |
+| `date_precision` | enum | NOT NULL DEFAULT `approximate` — `exact` · `approximate` · `year_only`. CHECK: `(date IS NOT NULL OR date_precision = 'approximate')` — when `date` is NULL (unknown), precision must be `approximate`. Agent A must always set this field; precision `exact` with a NULL date is invalid. |
 | `event_type` | enum | `crime_event` · `discovery` · `arrest` · `indictment` · `trial_start` · `verdict` · `sentencing` · `appeal_filed` · `appeal_ruling` · `release` · `death` · `media_coverage` · `other` |
 | `title` | text | |
 | `description` | text | |
@@ -1070,7 +1146,7 @@ CONSTRAINT: `CHECK (entity_type IN ('community_notes'))` — **canonical list of
 |-------|------|-------|
 | `id` | uuid | PK |
 | `case_id` | uuid | FK → cases (ON DELETE CASCADE) |
-| `parent_id` | uuid | FK → community_notes (self-ref, nullable) ON DELETE SET NULL — if parent is moderated/removed, replies are not deleted; they become top-level |
+| `parent_id` | uuid | `uuid NULL REFERENCES community_notes(id) ON DELETE SET NULL` — self-referencing FK for threaded replies. When a parent note is deleted/moderated, replies are preserved with `parent_id = NULL` (surfaced as top-level). |
 | `user_id` | uuid | FK → profiles (ON DELETE SET NULL) |
 | `body` | text | NOT NULL. CHECK (`length(trim(body)) > 0`). CHECK (`length(body) <= 50000`) — 50k char cap prevents runaway inserts. |
 | `upvote_count` | int | NOT NULL DEFAULT 0, CHECK (upvote_count >= 0) — trigger-maintained; trigger uses `GREATEST(upvote_count - 1, 0)` to prevent negative counts on duplicate deletes |
