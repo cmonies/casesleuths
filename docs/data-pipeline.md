@@ -145,6 +145,9 @@ New Case Request
 #### Source quality
 - [ ] No `source.url` values that 404 (spot check 3 random sources)
 - [ ] `entity_sources.claim_type` set correctly — no `court_finding` without a court document source
+- [ ] **Living unconvicted persons**: any factual claim in `cases.body` about a living person who is not `convicted` must be traceable to a named primary source (court document, official LE statement, or verifiable news article). This includes: "was seen at scene," "failed polygraph," "owned the weapon," "was last to see victim." If the source is a podcast or speculation — flag for human review before approve.
+
+**P0 auto-fail for living unconvicted persons:** Any claim that directly implies involvement without a court-document source → FAIL, route to `draft`.
 
 ### Output format:
 ```
@@ -156,8 +159,8 @@ violations: [
 notes: "..."
 ```
 
-PASS → set `review_status: qa_review`, log to `moderation_actions` (`action_type: approved`, `reason: "legal_review_pass"`)  
-FAIL → set `review_status: draft`, log violations to `moderation_actions` (`action_type: rejected`)
+PASS → set `review_status: qa_review`, increment no counters, log to `moderation_actions` (`action_type: approved`, `agent_source: agent_b`, `reason: "legal_review_pass"`)  
+FAIL → set `review_status: draft`, increment `cases.revision_count`, log violations to `moderation_actions` (`action_type: rejected`, `agent_source: agent_b`, `metadata: { violations: [...] }`)
 
 **P0 violations (any single one = auto-FAIL):**
 - Banned vocabulary used as a label
@@ -207,7 +210,10 @@ revision_notes: "..."
 ```
 
 APPROVED → set `review_status: approved`, log to `moderation_actions`  
-NEEDS_REVISION → set `review_status: legal_review`, log issues
+NEEDS_REVISION (editorial framing issue — body text needs rewriting) → set `review_status: draft`, increment `revision_count`. Agent A picks it up.  
+NEEDS_REVISION (vocab/label issue only — no body rewrite needed) → set `review_status: legal_review`, Agent B re-checks without Agent A involvement.
+
+**When `rejected` is used:** Admin-only. Set when a case will never be published (e.g. determined to be fabricated, subject of court order blocking publication, or out of scope). Not set by Agent B or C — their failures always route back to `draft` or `legal_review` for correction.
 
 **For `legal_sensitivity: high` cases:** Agent C flags for human review instead of auto-approving. Sets `review_status: approved` but adds a `moderation_actions` record with `action_type: approved`, `reason: "requires_human_final_approval"`. Human must then explicitly set `published_at` and `review_status: published`.
 
@@ -302,7 +308,7 @@ FAIL → review_status: draft
      → ... until PASS
 ```
 
-Maximum 3 revision loops before escalating to human review (flag in `moderation_actions` with `reason: 'max_revisions_exceeded'`).
+Maximum 3 revision loops (`cases.revision_count >= 3`) before escalating to human review. Log to `moderation_actions` with `reason: 'max_revisions_exceeded'`, `agent_source: agent_b`. Human must manually reset `revision_count` and set `review_status: legal_review` to re-enter the pipeline.
 
 ---
 

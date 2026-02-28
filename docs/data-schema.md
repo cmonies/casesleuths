@@ -1,6 +1,6 @@
 # CaseSleuths — Data Schema
 
-_v0.7 · 2026-02-28 — Added `cases.review_status` pipeline enum + `docs/data-pipeline.md` (4-agent seeding/review/audit process); also v0.6 P0 fixes: resolved upvote_count contradiction, added Enum Definitions section, fixed suppressed_entities partial UNIQUE, fixed slug_redirects FK to cases.id, added cases.deleted_at soft-delete, added CHECK constraints on content_warnings/primary_weapon/entity_sources, added UNIQUE(case_id,person_id) to case_people, fixed "CaseLog" → "CaseSleuths" in legal framework, added 6 missing indexes, documented all FK cascade policies_
+_v0.8 · 2026-02-28 — P0 fixes: resolved case_people UNIQUE contradiction (one row per person per case), fixed user_media_progress status enum mismatch, fixed suppressed_entities index entry in indexes table, declared charges composite FK explicitly, added charges_dropped to person_legal_status enum, added NOT NULL declarations on all critical fields, added community_notes.parent_id ON DELETE SET NULL, added upvote_count CHECK >= 0 + trigger clamp, added content_reports.entity_type CHECK, added review_status transition rules, clarified Agent C failure routing, added moderation_actions.agent_source field, added revision_count to cases_
 
 ---
 
@@ -148,6 +148,7 @@ See `docs/legal-safety-framework.md` for full policy. Key constraints:
 | `acquitted` | Charged, found not guilty |
 | `exonerated` | Previously convicted, conviction overturned |
 | `person_of_interest` | Named by investigators, not formally charged |
+| `charges_dropped` | Was formally charged; charges subsequently dropped or dismissed before trial |
 | `no_charges_filed` | Named in media or podcasts, never formally accused |
 | `witness` | Witness to events |
 | `detective` | Investigator on the case |
@@ -166,7 +167,7 @@ See `docs/legal-safety-framework.md` for full policy. Key constraints:
 | `case_status` | `unsolved` · `solved_convicted` · `solved_acquitted` · `solved_exonerated` · `ongoing_trial` · `cold_case` · `civil_resolution` · `closed_no_crime` · `closed_suspect_deceased` |
 | `legal_sensitivity` | `standard` · `elevated` · `high` |
 | `review_status` | `draft` · `legal_review` · `qa_review` · `approved` · `published` · `rejected` · `suppressed` |
-| `person_legal_status` | `victim` · `alleged` · `convicted` · `acquitted` · `exonerated` · `person_of_interest` · `no_charges_filed` · `witness` · `detective` · `attorney` · `judge` · `other` |
+| `person_legal_status` | `victim` · `alleged` · `convicted` · `acquitted` · `exonerated` · `charges_dropped` · `person_of_interest` · `no_charges_filed` · `witness` · `detective` · `attorney` · `judge` · `other` |
 | `name_display_policy` | `full` · `initials_only` · `redacted` · `auto` |
 | `photo_display_policy` | `allowed` · `blocked` · `requires_review` |
 | `app_role` | `user` · `moderator` · `admin` |
@@ -179,7 +180,7 @@ See `docs/legal-safety-framework.md` for full policy. Key constraints:
 | `news_source` | `manual` · `rss` · `google_news` |
 | `relevance` | `primary` · `mentions` |
 | `media_type` | `podcast_episode` · `tv_show` |
-| `media_progress_status` | `completed` · `in_progress` · `want_to_consume` |
+| `media_progress_status` | `completed` · `in_progress` · `want_to_consume` — **canonical values** (overrides any table definition using `watched`/`listening`/`want_to_watch`) |
 | `correction_status` | `pending` · `accepted` · `rejected` |
 | `report_reason` | `inaccurate` · `inappropriate` · `spam` · `copyright` · `other` |
 | `report_status` | `pending` · `reviewed` · `resolved` |
@@ -287,12 +288,12 @@ Case
 | Field | Type | Notes |
 |-------|------|-------|
 | `id` | uuid | PK |
-| `slug` | text | UNIQUE, URL-safe |
-| `title` | text | |
-| `alternate_names` | text[] | |
-| `status` | enum | `unsolved` · `solved_convicted` · `solved_acquitted` · `solved_exonerated` · `ongoing_trial` · `cold_case` · `civil_resolution` · `closed_no_crime` · `closed_suspect_deceased` |
-| `legal_sensitivity` | enum | `standard` · `elevated` · `high` — `high` blocks auto-publish |
-| `content_warnings` | text[] | Controlled list: `child_victim` · `sexual_violence` · `infant_victim` · `family_violence` · `mass_casualty` · `graphic_imagery_risk` |
+| `slug` | text | NOT NULL, UNIQUE, URL-safe |
+| `title` | text | NOT NULL |
+| `alternate_names` | text[] | NOT NULL DEFAULT '{}' |
+| `status` | enum | NOT NULL — `unsolved` · `solved_convicted` · `solved_acquitted` · `solved_exonerated` · `ongoing_trial` · `cold_case` · `civil_resolution` · `closed_no_crime` · `closed_suspect_deceased` |
+| `legal_sensitivity` | enum | NOT NULL DEFAULT `standard` — `high` blocks auto-publish |
+| `content_warnings` | text[] | NOT NULL DEFAULT '{}' — Controlled list: `child_victim` · `sexual_violence` · `infant_victim` · `family_violence` · `mass_casualty` · `graphic_imagery_risk` |
 | `jurisdiction_id` | uuid | FK → jurisdictions (SET NULL) — nullable |
 | `location_city` | text | |
 | `location_state` | text | |
@@ -312,7 +313,8 @@ Case
 | `og_image_url` | text | 1200×630 for Open Graph |
 | `number_of_victims` | int | nullable — for programmatic SEO stats pages |
 | `primary_weapon` | text | nullable — controlled: `firearm` · `knife` · `blunt_object` · `poison` · `strangulation` · `unknown` · `other` |
-| `review_status` | enum | `draft` · `legal_review` · `qa_review` · `approved` · `published` · `rejected` · `suppressed` — pipeline gate, see `docs/data-pipeline.md` |
+| `review_status` | enum | `draft` · `legal_review` · `qa_review` · `approved` · `published` · `rejected` · `suppressed` — pipeline gate, see `docs/data-pipeline.md`. **Valid transitions only:** `draft→legal_review`, `legal_review→qa_review`, `legal_review→draft` (fail), `qa_review→approved`, `qa_review→draft` (body rewrite needed), `approved→published`, `any→rejected` (admin only), `any→suppressed` (takedown). Enforced by app layer + trigger. `rejected` = permanently blocked (admin decision); not the same as Agent B/C FAIL which routes to `draft`. |
+| `revision_count` | int | NOT NULL DEFAULT 0 — incremented on each Agent B/C FAIL → draft cycle; escalates to human review after 3 |
 | `published_at` | timestamptz | null = draft. Never auto-set for `legal_sensitivity: high`. Must be accompanied by `review_status: published`. |
 | `deleted_at` | timestamptz | Soft delete. Cases are NEVER hard-deleted — destroys audit trail. Set `deleted_at` instead. RLS hides from all public queries. |
 | `created_at` | timestamptz | |
@@ -408,9 +410,9 @@ CONSTRAINT: `CHECK (case_id_a < case_id_b)` — prevents `(A,B)` and `(B,A)` dup
 | Field | Type | Notes |
 |-------|------|-------|
 | `id` | uuid | PK |
-| `slug` | text | UNIQUE, URL-safe — for person SEO pages |
-| `name` | text | |
-| `aliases` | text[] | |
+| `slug` | text | NOT NULL, UNIQUE, URL-safe — for person SEO pages |
+| `name` | text | NOT NULL |
+| `aliases` | text[] | NOT NULL DEFAULT '{}' |
 | `primary_known_role` | enum | **Display hint only.** Source of truth is `case_people.legal_status`. Values: see legal vocabulary above. |
 | `dob` | date | nullable |
 | `dod` | date | nullable |
@@ -434,18 +436,19 @@ Surrogate PK supports multi-role per case (e.g. initially `witness`, later `alle
 | `id` | uuid | PK (surrogate) |
 | `case_id` | uuid | FK → cases (ON DELETE CASCADE) |
 | `person_id` | uuid | FK → people (ON DELETE RESTRICT) |
-| `legal_status` | enum | **Source of truth.** Values: `victim` · `alleged` · `convicted` · `acquitted` · `exonerated` · `person_of_interest` · `no_charges_filed` · `witness` · `detective` · `attorney` · `judge` · `other` |
+| `legal_status` | enum | NOT NULL — **Source of truth.** Values: `victim` · `alleged` · `convicted` · `acquitted` · `exonerated` · `charges_dropped` · `person_of_interest` · `no_charges_filed` · `witness` · `detective` · `attorney` · `judge` · `other` |
 | `notes` | text | Case-specific context |
 | `is_primary` | bool | Flag most prominent role when multiple rows exist per person |
 | `created_at` | timestamptz | |
 | `updated_at` | timestamptz | |
 
-UNIQUE: `(case_id, person_id, legal_status)` — prevents exact duplicate role rows per case.
-UNIQUE: `(case_id, person_id)` — **also required** as a non-partial unique constraint so `charges` can hold a composite FK referencing `(case_id, person_id)` — ensuring no charge can exist for a person not linked to the case. Note: this means only one "primary" row per person per case when using the composite FK; the surrogate PK still allows multi-role rows via the `legal_status` uniqueness above.
+UNIQUE: `(case_id, person_id)` — **one row per person per case**. `legal_status` is updated in place as the investigation evolves (e.g. `witness` → `alleged`). Status change history is tracked in `moderation_actions` (before/after in `metadata`). The surrogate PK `id` is kept for stable FK references from `charges` and `appeals`.
+
+**When to update vs insert:** Always update the existing row. Never insert a second row for the same person-case pair. If a person's role in a case changes, update `legal_status` and log the change in `moderation_actions`.
 
 **FK cascade policies:**
-- `case_people.case_id` → CASCADE
-- `case_people.person_id` → RESTRICT
+- `case_people.case_id` → ON DELETE CASCADE
+- `case_people.person_id` → ON DELETE RESTRICT
 
 ---
 
@@ -691,7 +694,8 @@ Structured legal proceedings per person per case. `case_people.legal_status` is 
 | `id` | uuid | PK |
 | `case_id` | uuid | FK → cases (ON DELETE CASCADE) |
 | `person_id` | uuid | FK → people (ON DELETE RESTRICT) |
-| `charge_label` | text | e.g. `First-degree murder` |
+| `case_person_id` | uuid | FK → case_people.id (ON DELETE CASCADE) — ensures no charge for a person not linked to the case. Composite: `(case_id, person_id)` must match a `case_people` row. |
+| `charge_label` | text | NOT NULL — e.g. `First-degree murder` |
 | `statute_citation` | text | nullable — e.g. `Cal. Penal Code § 187` |
 | `filed_date` | date | nullable |
 | `disposition` | enum | `pending` · `dismissed` · `convicted` · `acquitted` · `plea_deal` · `mistrial` · `charges_dropped` |
@@ -713,7 +717,8 @@ Structured legal proceedings per person per case. `case_people.legal_status` is 
 | `id` | uuid | PK |
 | `case_id` | uuid | FK → cases (ON DELETE CASCADE) |
 | `person_id` | uuid | FK → people (ON DELETE RESTRICT) |
-| `charge_id` | uuid | FK → charges (nullable — SET NULL) |
+| `case_person_id` | uuid | FK → case_people.id (ON DELETE CASCADE) |
+| `charge_id` | uuid | FK → charges (nullable — ON DELETE SET NULL) |
 | `appeal_type` | enum | `direct_appeal` · `habeas_corpus` · `post_conviction_relief` · `civil` |
 | `filed_date` | date | nullable |
 | `status` | enum | `pending` · `granted` · `denied` · `withdrawn` |
@@ -833,12 +838,12 @@ CONSTRAINT: `CHECK (entity_type IN ('community_notes'))` — extend this list as
 |-------|------|-------|
 | `id` | uuid | PK |
 | `case_id` | uuid | FK → cases (ON DELETE CASCADE) |
-| `parent_id` | uuid | FK → community_notes (self-ref, nullable) — enables threading |
+| `parent_id` | uuid | FK → community_notes (self-ref, nullable) ON DELETE SET NULL — if parent is moderated/removed, replies are not deleted; they become top-level |
 | `user_id` | uuid | FK → profiles (ON DELETE SET NULL) |
 | `body` | text | |
-| `upvote_count` | int | NOT NULL DEFAULT 0 — trigger-maintained |
-| `is_pinned` | bool | |
-| `deleted_at` | timestamptz | Soft delete. UI shows "[removed]". RLS blocks new upvotes (`WHERE deleted_at IS NULL`). `upvote_count` is preserved — not zeroed — so restored notes recover their signal. |
+| `upvote_count` | int | NOT NULL DEFAULT 0, CHECK (upvote_count >= 0) — trigger-maintained; trigger uses `GREATEST(upvote_count - 1, 0)` to prevent negative counts on duplicate deletes |
+| `is_pinned` | bool | NOT NULL DEFAULT false |
+| `deleted_at` | timestamptz | Soft delete. UI shows "[removed]". RLS blocks new upvotes (`WHERE deleted_at IS NULL`). `upvote_count` preserved (not zeroed) — restored notes recover their signal. |
 | `created_at` | timestamptz | |
 | `updated_at` | timestamptz | |
 
@@ -865,8 +870,8 @@ CONSTRAINT: `CHECK (entity_type IN ('community_notes'))` — extend this list as
 |-------|------|-------|
 | `id` | uuid | PK |
 | `reporter_id` | uuid | FK → profiles (ON DELETE SET NULL) |
-| `entity_type` | text | |
-| `entity_id` | uuid | |
+| `entity_type` | text | NOT NULL, CHECK (`entity_type IN ('cases','community_notes','community_corrections','people','timeline_events','evidence')`) |
+| `entity_id` | uuid | NOT NULL |
 | `reason` | enum | `inaccurate` · `inappropriate` · `spam` · `copyright` · `other` |
 | `notes` | text | |
 | `status` | enum | `pending` · `reviewed` · `resolved` |
@@ -932,12 +937,13 @@ Immutable audit log of every moderation decision. Required for legal defense.
 | Field | Type | Notes |
 |-------|------|-------|
 | `id` | uuid | PK |
-| `moderator_id` | uuid | FK → profiles (SET NULL) |
-| `entity_type` | text | |
-| `entity_id` | uuid | |
-| `action_type` | enum | `approved` · `rejected` · `edited` · `deleted` · `restored` · `suppressed` · `unsuppressed` · `locked` · `unlocked` |
+| `moderator_id` | uuid | FK → profiles (SET NULL) — nullable; null when action is from an automated agent |
+| `agent_source` | text | nullable — `agent_a` · `agent_b` · `agent_c` · `agent_d` · `human`. Set when `moderator_id` is null. At least one must be non-null. |
+| `entity_type` | text | NOT NULL |
+| `entity_id` | uuid | NOT NULL |
+| `action_type` | enum | NOT NULL — `approved` · `rejected` · `edited` · `deleted` · `restored` · `suppressed` · `unsuppressed` · `locked` · `unlocked` |
 | `reason` | text | nullable |
-| `metadata` | jsonb | nullable — before/after diffs, relevant context |
+| `metadata` | jsonb | nullable — before/after diffs, violation lists from Agent B/C, relevant context |
 | `created_at` | timestamptz | NOT NULL DEFAULT now() — **no `updated_at`**: immutable audit log |
 
 ---
@@ -951,7 +957,7 @@ _Exception: no `created_at` — only tracks current state, not history._
 | `user_id` | uuid | FK → profiles (ON DELETE CASCADE) |
 | `media_type` | enum | `podcast_episode` · `tv_show` — `tv_show` covers all rows in `tv_shows` including documentaries |
 | `media_id` | uuid | |
-| `status` | enum | `watched` · `listening` · `want_to_watch` |
+| `status` | enum | `completed` · `in_progress` · `want_to_consume` |
 | `updated_at` | timestamptz | |
 
 PK: `(user_id, media_type, media_id)`
@@ -1018,7 +1024,7 @@ PK: `(user_id, media_type, media_id)`
 | `case_books` | `book_id` | btree | Books reverse lookup |
 | `content_takedown_requests` | `status` | btree | Open requests queue |
 | `content_takedown_requests` | `response_deadline` | partial (`WHERE resolved_at IS NULL`) | Overdue SLA alerts |
-| `suppressed_entities` | `(entity_type, entity_id)` | UNIQUE | Kill switch lookup |
+| `suppressed_entities` | `(entity_type, entity_id)` | partial UNIQUE (`WHERE lifted_at IS NULL`) | One active suppression per entity; allows re-suppression after lift |
 | `moderation_actions` | `(entity_type, entity_id)` | btree | Audit trail per entity |
 | `moderation_actions` | `moderator_id` | btree | Actions per moderator |
 | `case_agencies` | `agency_id` | btree | "Cases per agency" reverse lookup |
