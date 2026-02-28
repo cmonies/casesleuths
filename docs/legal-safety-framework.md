@@ -262,6 +262,102 @@ CaseLog, as a curator and organizer of podcast content, sits closer to the Post 
 
 ---
 
+## 11. Minor & Privacy Policies
+
+### Name and Photo Display Rules
+
+These are enforced at the app layer via `people.name_display_policy` and `people.photo_display_policy`. Editorial overrides are allowed but must be logged.
+
+| Scenario | Name | Photo |
+|---|---|---|
+| Minor victim (deceased/missing) | Full name ✅ | ✅ |
+| Minor POI/suspect named by law enforcement | Initials only (even if full name in media) | ❌ |
+| Minor charged as adult in adult court | Full name ✅ | ✅ |
+| Living minor in any other role | ❌ blocked | ❌ |
+| Minor who has since aged out (now adult) | Human review required | Human review required |
+| Any suppressed entity | "[Name withheld]" | ❌ |
+| Living person, not convicted | Full name + aggressive disclaimer | ✅ with editorial review |
+
+**`name_display_policy: auto`** (default) = system evaluates the above rules at render time. Override with an explicit policy value only when an editor has reviewed and made a deliberate decision. All overrides must be logged in `moderation_actions`.
+
+### Minors as Suspects or Persons of Interest
+
+- If a minor is named by law enforcement as a suspect, or arrested: we may discuss the case but use **initials only**, regardless of whether mainstream media has published the full name.
+- If a minor is charged as an adult and appearing in adult court: full name and photo are allowed per court record norms.
+- For all other living minors: no name, no photo, no identification of any kind.
+- When a minor ages out (turns 18): this does not automatically unlock display. Human review is required. Editorial consideration: does continued exposure cause disproportionate harm to the person's current life?
+
+### Living Persons Not Convicted
+
+Any living person who has not been convicted of a crime requires:
+1. Accurate `legal_status` (never `convicted` unless a conviction currently stands)
+2. Prominent disclaimer on their case page entry
+3. `photo_display_policy: requires_review` by default
+4. Special care in any page body text — no language implying guilt
+
+### Takedown Response SLAs
+
+All takedown/erasure requests must be logged in `content_takedown_requests` before any action is taken. Never handle informally.
+
+| Request Type | Response SLA | Default Action |
+|---|---|---|
+| Court order | 24 hours | Comply unless legally advised otherwise |
+| Attorney/legal demand letter | 72 hours | Legal review, then decision |
+| Minor aged-out request | 48 hours | Strong presumption toward compliance |
+| Victim/family personal request | 7 days | Case-by-case editorial review |
+| Subject personal request | 7 days | Case-by-case editorial review |
+| DMCA notice | 72 hours | Remove and send counter-notice option |
+
+After complying with any takedown:
+- Remove from Typesense search index
+- Submit Google Search Console URL removal request
+- Check that OG/social preview cache is invalidated
+- Document all steps in `moderation_actions`
+
+### Contact
+
+All takedown requests: takedowns@[domain] — must be monitored daily.
+
+---
+
+## 12. Takedown, Suppression & Erasure Policy
+
+### Suppression vs. Deletion
+
+We **suppress**, not delete. Suppression hides content from display while preserving the record for audit trail and potential legal evidence. Hard deletion destroys the audit trail and may constitute spoliation of evidence if litigation is pending.
+
+- Suppressed person → renders as "[Name withheld]" on all case pages site-wide
+- Suppressed case → renders as "[Case removed]" with no content visible
+- Data remains in database, accessible only to `admin` role
+
+### When We Must Comply
+
+- **Court orders:** Always comply within 24 hours. Document the order in `content_takedown_requests`.
+- **DMCA:** Comply under safe harbor (17 U.S.C. § 512). Log in `content_takedown_requests`, offer counter-notice process.
+
+### When Compliance Is Discretionary
+
+- **GDPR right to erasure (Article 17):** Has explicit carve-outs for journalism, research, and public interest. We are a journalism/reference site. We are not legally required to comply for content that is factually accurate and in the public interest. However, we may choose to suppress voluntarily — especially for minor privacy cases.
+- **Personal and family requests:** Evaluate case-by-case. Factors: is the person living, are they a minor (or were they at the time), has the situation changed, is the information accurate, does continued publication cause disproportionate harm?
+
+### What Must Never Be Deleted
+
+- `moderation_actions` records — immutable audit log
+- `content_takedown_requests` records — legal record of all requests and responses
+- `suppressed_entities` records — record of suppression decisions
+
+### Routine Maintenance After Any Takedown
+
+1. Apply suppression in `suppressed_entities`
+2. Log action in `moderation_actions`
+3. Trigger ISR revalidation on all affected pages
+4. Purge Typesense index entry
+5. Submit Google Search Console removal (takes 24–48h to propagate)
+6. Verify social preview cards no longer show suppressed content
+7. Update `content_takedown_requests.status` → `complied` and set `resolved_at`
+
+---
+
 ## Disclaimer
 
 _This document is an internal planning framework. It is not legal advice. Before launch, have a licensed attorney review the privacy policy, terms of service, DMCA registration, and any content policies that reference specific legal standards. This is especially important for cases involving ongoing trials, living suspects, and international jurisdictions._

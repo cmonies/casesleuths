@@ -1,6 +1,6 @@
 # CaseSleuths — Data Schema
 
-_v0.5 · 2026-02-27 — Round 4 fixes: legal framework doc sync, FK annotations on all join tables, tv_shows cascade fix, upvotes CHECK constraint, parent_id index_
+_v0.6 · 2026-02-28 — GPT-5.2 structural additions (charges, appeals, sources, jurisdictions, case series, books, moderation actions), minor/privacy policy fields, takedown/suppression tables, SEO fields, upvote hardening notes, timeline event_type enum_
 
 ---
 
@@ -27,6 +27,14 @@ _v0.5 · 2026-02-27 — Round 4 fixes: legal framework doc sync, FK annotations 
 | `community_notes` | **Client-side** | Supabase Realtime subscription |
 | `community_corrections` | **Client-side** | Supabase Realtime subscription |
 | `content_reports` | **Admin only** | Admin dashboard |
+| `charges` | SSG/ISR | DB webhook → resolve parent `case.slug` |
+| `appeals` | SSG/ISR | DB webhook → resolve parent `case.slug` |
+| `case_series` | SSG/ISR | DB webhook → series listing pages |
+| `books` / `case_books` | SSG/ISR | DB webhook → resolve parent `case.slug` |
+| `jurisdictions` | SSG/ISR | DB webhook → jurisdiction listing pages |
+| `content_takedown_requests` | **Admin only** | Admin dashboard |
+| `suppressed_entities` | **Admin only** | Admin dashboard — changes trigger ISR revalidation on affected pages |
+| `moderation_actions` | **Admin only** | Admin dashboard |
 | `upvotes` | **Client-side** | Supabase Realtime subscription |
 | `user_media_progress` | **Client-side** | Local optimistic update; no `created_at` (explicit exception — only tracks current state) |
 
@@ -36,6 +44,24 @@ _v0.5 · 2026-02-27 — Round 4 fixes: legal framework doc sync, FK annotations 
 - Person / agency pages: `revalidate: 3600` (1 hour)
 
 **Revalidation implementation:** Supabase DB webhooks → Next.js `/api/revalidate?secret=TOKEN&path=/cases/[slug]`. Webhooks required on: `cases`, `timeline_events`, `case_people`, `evidence`, `interviews`, `case_faqs`, `podcast_episodes`, `tv_shows`, `news_articles`, `case_subreddits`, `case_tags`, `related_cases`.
+
+---
+
+### Minor Name & Photo Display Rules
+
+Enforced in the app layer. The `people.name_display_policy` and `photo_display_policy` fields drive rendering.
+
+| Scenario | Name | Photo |
+|---|---|---|
+| Minor victim (deceased/missing) | Full name ✅ | ✅ |
+| Minor POI/suspect named by LE | Initials only | ❌ |
+| Minor charged as adult | Full name ✅ | ✅ |
+| Living minor (any other role) | ❌ blocked | ❌ |
+| Minor who aged out (now adult) | Human review required | Human review required |
+| Suppressed entity (any) | "[Name withheld]" | ❌ |
+| Living person, not convicted | Full name + aggressive disclaimer ✅ | ✅ with review |
+
+`name_display_policy: auto` = system evaluates the above rules at render time based on `is_minor_at_time_of_crime`, `is_minor_currently`, `is_living`, and `case_people.legal_status`. Override with explicit policy values when automated logic needs to be overridden by an editor.
 
 ---
 
@@ -50,7 +76,7 @@ Reddit's model (and ours): **optimistic updates + Supabase Realtime push**.
 
 **Count strategy:** Trigger-maintained `upvote_count int NOT NULL DEFAULT 0` on each upvotable entity. Do NOT use `SELECT COUNT(*) GROUP BY` views on hot paths.
 
-**Soft delete policy:** When an entity is soft-deleted (`deleted_at` set), a trigger zeros its `upvote_count`. RLS blocks new upvotes on soft-deleted entities (`WHERE deleted_at IS NULL`).
+**Soft delete policy:** When an entity is soft-deleted (`deleted_at` set), RLS blocks new upvotes (`WHERE deleted_at IS NULL`). **Do NOT zero `upvote_count` on soft delete** — historical count is preserved so restored entities recover their signal.
 
 **Ongoing trial lock:** Cases with `status = 'ongoing_trial'` have community contributions (notes, corrections, upvotes) blocked via RLS. No annotations on active criminal proceedings.
 
@@ -85,6 +111,12 @@ $$ LANGUAGE plpgsql;
 -- CREATE TRIGGER update_upvote_count AFTER INSERT OR DELETE ON upvotes
 --   FOR EACH ROW EXECUTE FUNCTION update_upvote_count();
 ```
+
+**Security note:** The dynamic SQL in the trigger uses `entity_type` as a table name. The `CHECK` constraint on `entity_type` is the sole injection guard — never remove it or allow unvalidated values in this column. For maximum safety at scale, replace with per-entity triggers (one dedicated trigger per upvotable table).
+
+**Hot-row contention note:** At high traffic, constant `upvote_count` increments on a single row can become a write bottleneck. Mitigation at scale: sharded counter tables or batched aggregation. For MVP (top 20 cases), trigger approach is fine.
+
+**Client implementation note:** Supabase Realtime channels must be explicitly unsubscribed when the user navigates away from a case page. Failing to do so causes memory leaks as channels accumulate. Scope each subscription to the page lifecycle (mount → subscribe, unmount → unsubscribe).
 
 ---
 
@@ -138,26 +170,36 @@ See `docs/legal-safety-framework.md` for full policy. Key constraints:
 
 ```
 Case
- ├── Timeline (events)
+ ├── Timeline (events with event_type enum)
  ├── Knowledge Graph (derived from existing joins at MVP — no dedicated tables)
  ├── Tags (normalized, browsable tag pages)
  ├── Content Warnings
- ├── People (legal-status labeled)
+ ├── People (legal-status labeled, minor/privacy flags)
+ │    └── Charges (structured legal proceedings per person)
+ │         └── Appeals (per charge or per case)
+ ├── Sources (citation trail — defamation defense)
+ ├── Jurisdictions (state/country — programmatic SEO)
+ ├── Case Series (serial killer / connected case grouping)
  ├── Agencies
  ├── Evidence
  ├── Interviews (with interview_people join for group interviews)
  ├── Media Coverage
  │    ├── Podcast Episodes (RSS auto-ingest)
  │    ├── TV Shows / Documentaries (TMDB)
- │    └── News Articles
+ │    ├── News Articles
+ │    └── Books
  ├── Reddit (subreddits + top posts)
  ├── Related Cases
  ├── FAQs
- └── Community Layer (client-side, Realtime)
-      ├── Upvotes (trigger count + Realtime push)
-      ├── Notes (soft delete, optional threading via parent_id)
-      ├── Corrections
-      └── Reports
+ ├── Community Layer (client-side, Realtime)
+ │    ├── Upvotes (trigger count + Realtime push)
+ │    ├── Notes (soft delete, optional threading via parent_id)
+ │    ├── Corrections
+ │    └── Reports
+ └── Admin / Legal Layer
+      ├── Content Takedown Requests
+      ├── Suppressed Entities (kill switch)
+      └── Moderation Actions (immutable audit log)
 ```
 
 ---
@@ -193,12 +235,16 @@ Case
 | `status` | enum | `unsolved` · `solved_convicted` · `solved_acquitted` · `solved_exonerated` · `ongoing_trial` · `cold_case` · `civil_resolution` · `closed_no_crime` · `closed_suspect_deceased` |
 | `legal_sensitivity` | enum | `standard` · `elevated` · `high` — `high` blocks auto-publish |
 | `content_warnings` | text[] | Controlled list: `child_victim` · `sexual_violence` · `infant_victim` · `family_violence` · `mass_casualty` · `graphic_imagery_risk` |
+| `jurisdiction_id` | uuid | FK → jurisdictions (SET NULL) — nullable |
 | `location_city` | text | |
 | `location_state` | text | |
 | `location_country` | text | default `US` |
+| `state_code` | text | 2-letter US state code — for /state/california SEO pages |
+| `country_code` | text | NOT NULL default `US` — for international filtering |
 | `location_coords` | point | lat/lng |
 | `date_start` | date | |
 | `date_end` | date | nullable |
+| `year` | int | Generated from `date_start` (or manual override) — for /year/1994 SEO pages |
 | `summary` | text | |
 | `body` | text | Plain Markdown |
 | `disclaimer` | text | Shown prominently — e.g. "No one has been charged in this case." |
@@ -206,6 +252,8 @@ Case
 | `seo_description` | text | |
 | `cover_image_url` | text | |
 | `og_image_url` | text | 1200×630 for Open Graph |
+| `number_of_victims` | int | nullable — for programmatic SEO stats pages |
+| `primary_weapon` | text | nullable — controlled: `firearm` · `knife` · `blunt_object` · `poison` · `strangulation` · `unknown` · `other` |
 | `published_at` | timestamptz | null = draft. Never auto-set for `legal_sensitivity: high` |
 | `created_at` | timestamptz | |
 | `updated_at` | timestamptz | |
@@ -282,6 +330,7 @@ CONSTRAINT: `CHECK (case_id_a < case_id_b)` — prevents `(A,B)` and `(B,A)` dup
 | `case_id` | uuid | FK → cases (ON DELETE CASCADE) |
 | `date` | date | |
 | `date_precision` | enum | `exact` · `approximate` · `year_only` |
+| `event_type` | enum | `crime_event` · `discovery` · `arrest` · `indictment` · `trial_start` · `verdict` · `sentencing` · `appeal_filed` · `appeal_ruling` · `release` · `death` · `media_coverage` · `other` |
 | `title` | text | |
 | `description` | text | |
 | `source_url` | text | Citation |
@@ -306,6 +355,11 @@ CONSTRAINT: `CHECK (case_id_a < case_id_b)` — prevents `(A,B)` and `(B,A)` dup
 | `dod` | date | nullable |
 | `bio` | text | |
 | `photo_url` | text | |
+| `is_living` | bool | nullable — null = unknown. `true` + not convicted → aggressive disclaimer required |
+| `is_minor_at_time_of_crime` | bool | nullable — under 18 when the crime occurred |
+| `is_minor_currently` | bool | nullable — still a minor today (derived from DOB, can be overridden) |
+| `name_display_policy` | enum | `full` · `initials_only` · `redacted` · `auto` — default `auto` (enforces minor display rules) |
+| `photo_display_policy` | enum | `allowed` · `blocked` · `requires_review` — default `requires_review` |
 | `links` | jsonb | `{ "wikipedia": "...", "news": [...] }` |
 | `created_at` | timestamptz | |
 | `updated_at` | timestamptz | |
@@ -548,6 +602,147 @@ Retention: keep top 50 posts per case by score. Upsert on `post_id` UNIQUE on ea
 
 ---
 
+### `jurisdictions`
+
+| Field | Type | Notes |
+|-------|------|-------|
+| `id` | uuid | PK |
+| `name` | text | e.g. `Los Angeles County, CA` |
+| `state_code` | text | nullable — 2-letter US state |
+| `country_code` | text | NOT NULL default `US` |
+| `jurisdiction_type` | enum | `federal` · `state` · `county` · `city` · `international` |
+| `created_at` | timestamptz | |
+| `updated_at` | timestamptz | |
+
+---
+
+### `charges`
+
+Structured legal proceedings per person per case. `case_people.legal_status` is the display shorthand; `charges` is the source-of-truth legal record.
+
+| Field | Type | Notes |
+|-------|------|-------|
+| `id` | uuid | PK |
+| `case_id` | uuid | FK → cases (ON DELETE CASCADE) |
+| `person_id` | uuid | FK → people (ON DELETE RESTRICT) |
+| `charge_label` | text | e.g. `First-degree murder` |
+| `statute_citation` | text | nullable — e.g. `Cal. Penal Code § 187` |
+| `filed_date` | date | nullable |
+| `disposition` | enum | `pending` · `dismissed` · `convicted` · `acquitted` · `plea_deal` · `mistrial` · `charges_dropped` |
+| `disposition_date` | date | nullable |
+| `sentence_summary` | text | nullable — e.g. `Life without parole` |
+| `jurisdiction_id` | uuid | FK → jurisdictions (SET NULL) |
+| `court_name` | text | nullable |
+| `created_at` | timestamptz | |
+| `updated_at` | timestamptz | |
+
+**Display note:** If a person has charges with `disposition: pending`, show "Convicted (appealing)" or "Charged (trial pending)" in the UI — not just the flat `legal_status` value.
+
+---
+
+### `appeals`
+
+| Field | Type | Notes |
+|-------|------|-------|
+| `id` | uuid | PK |
+| `case_id` | uuid | FK → cases (ON DELETE CASCADE) |
+| `person_id` | uuid | FK → people (ON DELETE RESTRICT) |
+| `charge_id` | uuid | FK → charges (nullable — SET NULL) |
+| `appeal_type` | enum | `direct_appeal` · `habeas_corpus` · `post_conviction_relief` · `civil` |
+| `filed_date` | date | nullable |
+| `status` | enum | `pending` · `granted` · `denied` · `withdrawn` |
+| `outcome_summary` | text | nullable |
+| `created_at` | timestamptz | |
+| `updated_at` | timestamptz | |
+
+**Display note:** Active appeal → show "Convicted (appealing)" rather than "Convicted" on case pages.
+
+---
+
+### `sources`
+
+Citation trail — defamation defense. Every factual claim should have a source record.
+
+| Field | Type | Notes |
+|-------|------|-------|
+| `id` | uuid | PK |
+| `source_type` | enum | `court_document` · `news_article` · `official_statement` · `book` · `documentary` · `podcast_episode` · `other` |
+| `title` | text | |
+| `publisher` | text | nullable |
+| `url` | text | NOT NULL |
+| `archived_url` | text | nullable — Wayback Machine fallback |
+| `published_at` | timestamptz | nullable |
+| `created_at` | timestamptz | |
+| `updated_at` | timestamptz | |
+
+### `entity_sources` (pure join — no timestamps)
+
+Links sources to any entity (case, person, timeline event, evidence, etc.) with claim type tagging.
+
+| Field | Type | Notes |
+|-------|------|-------|
+| `source_id` | uuid | FK → sources (ON DELETE CASCADE) |
+| `entity_type` | text | Table name — `cases` · `people` · `timeline_events` · `evidence` · etc. |
+| `entity_id` | uuid | |
+| `claim_type` | enum | `allegation` · `court_finding` · `media_report` · `official_statement` — prevents editors from implying guilt |
+| `notes` | text | nullable |
+
+PK: `(source_id, entity_type, entity_id)`
+
+---
+
+### `case_series`
+
+Groups serial killer cases or connected case clusters.
+
+| Field | Type | Notes |
+|-------|------|-------|
+| `id` | uuid | PK |
+| `name` | text | e.g. `Ted Bundy Murders` |
+| `slug` | text | UNIQUE |
+| `description` | text | nullable |
+| `created_at` | timestamptz | |
+| `updated_at` | timestamptz | |
+
+### `case_series_members` (pure join — no timestamps)
+
+| Field | Type | Notes |
+|-------|------|-------|
+| `series_id` | uuid | FK → case_series (ON DELETE CASCADE) |
+| `case_id` | uuid | FK → cases (ON DELETE CASCADE) |
+| `sort_order` | int | |
+
+PK: `(series_id, case_id)`
+
+---
+
+### `books`
+
+| Field | Type | Notes |
+|-------|------|-------|
+| `id` | uuid | PK |
+| `title` | text | |
+| `author` | text | |
+| `isbn` | text | UNIQUE, nullable |
+| `published_year` | int | nullable |
+| `publisher` | text | nullable |
+| `cover_image_url` | text | nullable |
+| `description` | text | nullable |
+| `buy_url` | text | nullable |
+| `created_at` | timestamptz | |
+| `updated_at` | timestamptz | |
+
+### `case_books` (pure join — no timestamps)
+
+| Field | Type | Notes |
+|-------|------|-------|
+| `case_id` | uuid | FK → cases (ON DELETE CASCADE) |
+| `book_id` | uuid | FK → books (ON DELETE CASCADE) |
+
+PK: `(case_id, book_id)`
+
+---
+
 ## Community Layer
 
 > All community data is **client-side fetched**. Never SSG. Use Supabase Realtime.
@@ -614,6 +809,73 @@ CONSTRAINT: `CHECK (entity_type IN ('community_notes'))` — extend this list as
 | `created_at` | timestamptz | |
 | `updated_at` | timestamptz | |
 
+---
+
+## Admin / Legal Layer
+
+> These tables are admin-only. Never exposed via public API or client-side Supabase queries. RLS: `admin` role only.
+
+### `content_takedown_requests`
+
+All takedown/erasure/legal requests must be logged here — never handle informally.
+
+| Field | Type | Notes |
+|-------|------|-------|
+| `id` | uuid | PK |
+| `request_type` | enum | `legal_demand` · `family_request` · `subject_request` · `minor_aged_out` · `victim_privacy` · `court_order` · `dmca` |
+| `entity_type` | text | What is being requested for removal |
+| `entity_id` | uuid | |
+| `requester_name` | text | nullable |
+| `requester_email` | text | nullable |
+| `requester_organization` | text | nullable — law firm, family org, etc. |
+| `details` | text | Full description of request |
+| `supporting_document_url` | text | nullable — uploaded letter, court order, etc. |
+| `status` | enum | `received` · `under_review` · `complied` · `partially_complied` · `denied` · `escalated` |
+| `assigned_to` | uuid | FK → profiles (nullable) |
+| `response_notes` | text | nullable |
+| `response_deadline` | timestamptz | nullable — 24h for `court_order`, 72h for `legal_demand`, 7 days for personal requests |
+| `resolved_at` | timestamptz | nullable |
+| `created_at` | timestamptz | |
+| `updated_at` | timestamptz | |
+
+**Response SLAs:** `court_order` = 24h · `legal_demand` = 72h · `minor_aged_out` = 48h · all others = 7 days. After complying: purge Typesense index entry, submit Google Search Console removal request, check OG cache.
+
+### `suppressed_entities`
+
+Kill switch. Suppressed person → renders as "[Name withheld]" site-wide. Suppressed case → renders as "[Case removed]". Data is preserved for audit/legal; only display is blocked.
+
+| Field | Type | Notes |
+|-------|------|-------|
+| `id` | uuid | PK |
+| `entity_type` | text | `people` · `cases` |
+| `entity_id` | uuid | |
+| `reason` | enum | `legal_demand` · `court_order` · `minor_privacy` · `victim_request` · `family_request` · `editorial` |
+| `takedown_request_id` | uuid | FK → content_takedown_requests (nullable) |
+| `suppressed_by` | uuid | FK → profiles (NOT NULL) |
+| `suppressed_at` | timestamptz | NOT NULL DEFAULT now() |
+| `lifted_at` | timestamptz | nullable — if suppression was later reversed |
+| `lift_reason` | text | nullable |
+| `created_at` | timestamptz | |
+
+UNIQUE: `(entity_type, entity_id)` — one active suppression record per entity. No `updated_at` — immutable; use `lifted_at` to record reversal.
+
+### `moderation_actions`
+
+Immutable audit log of every moderation decision. Required for legal defense.
+
+| Field | Type | Notes |
+|-------|------|-------|
+| `id` | uuid | PK |
+| `moderator_id` | uuid | FK → profiles (SET NULL) |
+| `entity_type` | text | |
+| `entity_id` | uuid | |
+| `action_type` | enum | `approved` · `rejected` · `edited` · `deleted` · `restored` · `suppressed` · `unsuppressed` · `locked` · `unlocked` |
+| `reason` | text | nullable |
+| `metadata` | jsonb | nullable — before/after diffs, relevant context |
+| `created_at` | timestamptz | NOT NULL DEFAULT now() — **no `updated_at`**: immutable audit log |
+
+---
+
 ### `user_media_progress`
 
 _Exception: no `created_at` — only tracks current state, not history._
@@ -673,6 +935,26 @@ PK: `(user_id, media_type, media_id)`
 | `news_articles` | `url` | UNIQUE | News deduplication |
 | `news_articles` | `published_at` | btree | Recent articles listing |
 | `slug_redirects` | `old_slug` | UNIQUE | Redirect lookups |
+| `jurisdictions` | `state_code` | btree | State SEO pages |
+| `cases` | `state_code` | btree | /state/california pages |
+| `cases` | `year` | btree | /year/1994 pages |
+| `cases` | `jurisdiction_id` | btree | FK join |
+| `charges` | `case_id` | btree | FK join |
+| `charges` | `person_id` | btree | Charges per person |
+| `charges` | `disposition` | btree | Filter by outcome |
+| `appeals` | `case_id` | btree | FK join |
+| `appeals` | `person_id` | btree | Appeals per person |
+| `appeals` | `status` | partial (`WHERE status = 'pending'`) | Active appeals |
+| `entity_sources` | `(entity_type, entity_id)` | btree | Sources for an entity |
+| `case_series` | `slug` | UNIQUE | Series page lookups |
+| `case_series_members` | `case_id` | btree | Series a case belongs to |
+| `books` | `isbn` | UNIQUE | Deduplication |
+| `case_books` | `book_id` | btree | Books reverse lookup |
+| `content_takedown_requests` | `status` | btree | Open requests queue |
+| `content_takedown_requests` | `response_deadline` | partial (`WHERE resolved_at IS NULL`) | Overdue SLA alerts |
+| `suppressed_entities` | `(entity_type, entity_id)` | UNIQUE | Kill switch lookup |
+| `moderation_actions` | `(entity_type, entity_id)` | btree | Audit trail per entity |
+| `moderation_actions` | `moderator_id` | btree | Actions per moderator |
 
 ---
 
