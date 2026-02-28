@@ -230,6 +230,23 @@ CREATE POLICY "auth_insert_upvote" ON upvotes FOR INSERT TO authenticated
 CREATE POLICY "auth_delete_own_upvote" ON upvotes FOR DELETE TO authenticated
   USING (user_id = auth.uid());
 ```
+-- REQUIRED GRANTS: anon must be able to SELECT from public views (views don't inherit
+-- base table grants; explicit GRANT is required in Supabase for anon reads to work)
+GRANT SELECT ON public_cases TO anon, authenticated;
+GRANT SELECT ON public_case_people TO anon, authenticated;
+GRANT SELECT ON public_case_tombstones TO anon, authenticated;
+-- public_people is ADMIN/EDITORIAL only — do NOT grant to anon
+GRANT SELECT ON public_people TO authenticated;  -- editorial/admin tools only
+
+-- REQUIRED: upvotes immutability — prevent count drift from UPDATE operations
+CREATE OR REPLACE FUNCTION block_upvote_update() RETURNS TRIGGER AS $$
+BEGIN
+  RAISE EXCEPTION 'upvotes rows are immutable — delete and re-insert instead of updating';
+END;
+$$ LANGUAGE plpgsql;
+-- CREATE TRIGGER block_upvote_update BEFORE UPDATE ON upvotes
+--   FOR EACH ROW EXECUTE FUNCTION block_upvote_update();
+
 -- REQUIRED: ongoing_trial community lock — these policies MUST be in the migration
 -- community_notes INSERT: block on ongoing_trial cases
 CREATE POLICY "block_ongoing_trial_notes" ON community_notes FOR INSERT TO authenticated
@@ -340,7 +357,9 @@ SELECT
   END AS display_photo_url,
   cp.legal_status,
   cp.case_role,
-  cp.notes,
+  -- cp.notes EXCLUDED: editorial/internal notes; may contain unvetted allegations.
+  -- Not safe for public-facing views (platform-owned publication surface risk).
+  -- Admin tools must query case_people base table via service-role to access notes.
   cp.is_primary,
   p.slug,
   p.primary_known_role,
