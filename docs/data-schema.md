@@ -127,22 +127,36 @@ SELECT
     ELSE p.photo_url
   END AS display_photo_url,
   p.slug,
-  p.aliases,
+  -- Suppress identifying fields when name is withheld — indirect identification via bio/dob/aliases
+  -- is a real privacy risk. Admin tools needing full data must query base table via service-role.
+  CASE WHEN se.id IS NOT NULL OR p.name_display_policy IN ('redacted','requires_human_review','initials_only')
+       OR p.name_display_policy = 'auto'
+       THEN NULL ELSE p.aliases END AS aliases,
   p.primary_known_role,
-  p.dob,
-  p.dod,
-  p.bio,
+  CASE WHEN se.id IS NOT NULL OR p.name_display_policy IN ('redacted','requires_human_review','initials_only')
+       OR p.name_display_policy = 'auto'
+       THEN NULL ELSE p.dob END AS dob,
+  CASE WHEN se.id IS NOT NULL OR p.name_display_policy IN ('redacted','requires_human_review','initials_only')
+       OR p.name_display_policy = 'auto'
+       THEN NULL ELSE p.dod END AS dod,
+  CASE WHEN se.id IS NOT NULL OR p.name_display_policy IN ('redacted','requires_human_review','initials_only')
+       OR p.name_display_policy = 'auto'
+       THEN NULL ELSE p.bio END AS bio,
   p.is_living,
   p.is_minor_at_time_of_crime,
   p.is_minor_currently,
   p.name_display_policy,
   p.photo_display_policy,
-  p.links,
+  CASE WHEN se.id IS NOT NULL OR p.name_display_policy IN ('redacted','requires_human_review','initials_only')
+       OR p.name_display_policy = 'auto'
+       THEN NULL ELSE p.links END AS links,
   p.created_at,
   p.updated_at
 FROM people p
 LEFT JOIN suppressed_entities se
   ON se.entity_type = 'people' AND se.entity_id = p.id AND se.lifted_at IS NULL;
+-- NOTE: public_people is ADMIN/EDITORIAL only. All identifying fields suppressed when name is withheld.
+-- Admin tools needing full data on suppressed/review persons must use service-role queries on base table.
 
 -- public_case_tombstones: returns suppressed cases with redacted fields for tombstone pages
 -- Required for rendering "[Case removed]" pages at known URLs after takedowns.
@@ -164,7 +178,14 @@ JOIN suppressed_entities se
   ON se.entity_type = 'cases' AND se.entity_id = c.id AND se.lifted_at IS NULL
 WHERE c.deleted_at IS NULL;
 -- Usage: app layer checks public_case_tombstones before 404ing on a known slug.
--- Routing logic: if slug exists in public_case_tombstones → serve 410 Gone with notice.
+-- Routing logic (both views are anon-accessible via RLS policies):
+--   SELECT * FROM public_cases WHERE slug = $slug → found = 200 OK
+--   SELECT * FROM public_cases WHERE slug = $slug → not found:
+--     SELECT * FROM public_case_tombstones WHERE original_slug = $slug → found = 410 Gone
+--     SELECT * FROM public_case_tombstones WHERE original_slug = $slug → not found = 404 Not Found
+-- Anon never queries base `cases` table — routing is entirely via these two views.
+-- Note: slug_redirects handles renamed slugs; check slug_redirects BEFORE tombstones
+-- if you want clean redirect chains (old_slug → new_slug before checking suppression).
 
 -- public_cases: hides soft-deleted and suppressed cases from public queries
 CREATE OR REPLACE VIEW public_cases WITH (security_barrier = true) AS
@@ -403,7 +424,7 @@ BEGIN
   RETURN NEW;
 END;
 $$ LANGUAGE plpgsql;
--- CREATE TRIGGER block_high_sensitivity_autopublish BEFORE UPDATE ON cases
+-- CREATE TRIGGER bbb_block_high_sensitivity_autopublish BEFORE UPDATE ON cases
 --   FOR EACH ROW EXECUTE FUNCTION block_high_sensitivity_autopublish();
 
 -- Source coverage publish gate trigger
@@ -438,7 +459,7 @@ BEGIN
   RETURN NEW;
 END;
 $$ LANGUAGE plpgsql;
--- CREATE TRIGGER check_source_coverage BEFORE UPDATE ON cases
+-- CREATE TRIGGER ddd_check_source_coverage BEFORE UPDATE ON cases
 --   FOR EACH ROW EXECUTE FUNCTION check_source_coverage();
 
 -- cases DELETE block: cases are never hard-deleted; enforces soft-delete-only policy
@@ -496,13 +517,11 @@ END;
 $$ LANGUAGE plpgsql;
 -- TRIGGER ORDERING NOTE: Postgres fires BEFORE UPDATE triggers alphabetically by trigger name.
 -- The four BEFORE UPDATE triggers on `cases` must fire in this order:
---   1. enforce_review_status_transition (validate transition FIRST — cheapest gate)
---   2. block_high_sensitivity_autopublish (check moderation_actions)
---   3. check_living_person_disclaimer (scan case_people)
---   4. check_source_coverage (scan entity_sources + timeline_events)
--- To force enforce_review_status_transition to fire first despite alphabetical ordering,
--- the trigger is named with an 'aaa_' prefix. Trigger names intentionally prefixed to
--- control execution order — do not rename without considering trigger firing sequence.
+--   1. enforce_review_status_transition → prefix: aaa_ (cheapest gate, validate transition first)
+--   2. block_high_sensitivity_autopublish → prefix: bbb_ (check moderation_actions)
+--   3. check_living_person_disclaimer → prefix: ccc_ (scan case_people)
+--   4. check_source_coverage → prefix: ddd_ (scan entity_sources + timeline_events — most expensive)
+-- Trigger names below MUST use these prefixes. Do not rename without adjusting all four.
 -- CREATE TRIGGER aaa_enforce_review_status_transition BEFORE UPDATE ON cases
 --   FOR EACH ROW WHEN (OLD.review_status IS DISTINCT FROM NEW.review_status)
 --   EXECUTE FUNCTION enforce_review_status_transition();
@@ -533,7 +552,7 @@ BEGIN
   RETURN NEW;
 END;
 $$ LANGUAGE plpgsql;
--- CREATE TRIGGER check_living_person_disclaimer BEFORE UPDATE ON cases
+-- CREATE TRIGGER ccc_check_living_person_disclaimer BEFORE UPDATE ON cases
 --   FOR EACH ROW EXECUTE FUNCTION check_living_person_disclaimer();
 
 -- community_notes soft-delete: null out parent_id on children when parent is soft-deleted
@@ -912,7 +931,7 @@ Query pattern: `WHERE case_id_a = X OR case_id_b = X`.
 | `id` | uuid | PK |
 | `case_id` | uuid | NOT NULL, FK → cases (ON DELETE CASCADE) |
 | `date` | date | |
-| `date_precision` | enum | NOT NULL DEFAULT `approximate` — `exact` · `approximate` · `year_only`. CHECK: `(date IS NOT NULL OR date_precision = 'approximate')` — when `date` is NULL (unknown), precision must be `approximate`. Semantics: `exact` = confirmed date; `approximate` = estimated (UI: "circa [date]"); `year_only` = only year is known — store as `YYYY-01-01` (January 1 of the year as a placeholder), UI renders as "[year]" only. A real date with `approximate` precision is valid — means "approximately this date." For `year_only`, set `date = '[year]-01-01'::date` so the NOT NULL constraint is satisfied; the precision field signals to UI not to display month/day. Agent A must always set this explicitly; never leave at default without intention. |
+| `date_precision` | enum | NOT NULL DEFAULT `approximate` — `exact` · `approximate` · `year_only`. CHECKs: `(date IS NOT NULL OR date_precision = 'approximate')` — when `date` is NULL, precision must be `approximate`. Additionally: `(date_precision != 'year_only' OR EXTRACT(MONTH FROM date) = 1 AND EXTRACT(DAY FROM date) = 1)` — year_only dates must use Jan 1 placeholder; enforces the encoding convention at DB level. Semantics: `exact` = confirmed date; `approximate` = estimated (UI: "circa [date]"); `year_only` = only year is known — store as `YYYY-01-01` (January 1 of the year as a placeholder), UI renders as "[year]" only. A real date with `approximate` precision is valid — means "approximately this date." For `year_only`, set `date = '[year]-01-01'::date` so the NOT NULL constraint is satisfied; the precision field signals to UI not to display month/day. Agent A must always set this explicitly; never leave at default without intention. |
 | `event_type` | enum | `crime_event` · `discovery` · `arrest` · `indictment` · `trial_start` · `verdict` · `sentencing` · `appeal_filed` · `appeal_ruling` · `release` · `death` · `media_coverage` · `other` |
 | `title` | text | |
 | `description` | text | |
@@ -1294,7 +1313,7 @@ Citation trail — defamation defense. Every factual claim should have a source 
 | `created_at` | timestamptz | |
 | `updated_at` | timestamptz | |
 
-**URL canonicalization required before INSERT:** strip UTM params, normalize trailing slash, lowercase scheme+host. Use a helper function in the app layer — do NOT rely on the DB to normalize. `sources.url UNIQUE` deduplication is case-sensitive in Postgres; inconsistent normalization (e.g. `http://` vs `https://`, trailing slash vs none) will cause duplicate rows to bypass the UNIQUE constraint. Canonical form: `https://host.com/path` (no trailing slash, no query params except content-relevant ones).
+**URL canonicalization required before INSERT:** strip UTM params, normalize trailing slash, lowercase scheme+host. Use a helper function in the app layer — do NOT rely on the DB to normalize. `sources.url UNIQUE` deduplication is case-sensitive in Postgres; inconsistent normalization will cause duplicate rows. **Migration must add a case-insensitive functional unique index:** `CREATE UNIQUE INDEX sources_url_lower_unique ON sources (lower(url));` and drop the plain UNIQUE constraint, OR store urls always-lowercased via a BEFORE INSERT trigger. Canonical form: `https://host.com/path` (no trailing slash, no query params except content-relevant ones).
 
 ### `entity_sources` (pure join — no timestamps)
 
@@ -1522,7 +1541,7 @@ _Exception: no `created_at` — only tracks current state, not history._
 |-------|------|-------|
 | `user_id` | uuid | FK → profiles (ON DELETE CASCADE) |
 | `media_type` | enum | `podcast_episode` · `tv_show` — `tv_show` covers all rows in `tv_shows` including documentaries |
-| `media_id` | uuid | |
+| `media_id` | uuid | No Postgres FK (polymorphic — references `case_podcast_episodes` or `tv_shows` depending on `media_type`). **Orphan policy:** no cleanup trigger. Accept orphans — if the media row is deleted, progress rows become stale but harmless (UI filters by joining to the media table). Nightly reconciliation not required; rows auto-orphan silently and are excluded from JOIN-based queries. |
 | `status` | enum | `completed` · `in_progress` · `want_to_consume` |
 | `updated_at` | timestamptz | |
 
