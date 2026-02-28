@@ -1,6 +1,6 @@
 # CaseSleuths — Data Schema
 
-_v0.9 · 2026-02-28 — P0 fixes: added qa_review→legal_review transition, fixed upvote trigger GREATEST clamp. P1 fixes: dropped redundant case_id/person_id from charges/appeals (join through case_people only), moderation_actions mutual non-null CHECK, Agent D stale pipeline + auto-suppress P0 policy, charges/appeals case_person_id indexes, sources.url UNIQUE, minimum source coverage publish gate, pipeline publish flow for standard/elevated cases. P2 fixes: charges_dropped in legal framework, suppressed_entities.entity_type CHECK, agent model specs, Typesense suppression note, pipeline diagram updated_
+_v0.16 · 2026-02-28 — P0 fixes: added qa_review→legal_review transition, fixed upvote trigger GREATEST clamp. P1 fixes: dropped redundant case_id/person_id from charges/appeals (join through case_people only), moderation_actions at-least-one-non-null CHECK, Agent D stale pipeline + auto-suppress P0 policy, charges/appeals case_person_id indexes, sources.url UNIQUE, minimum source coverage publish gate, pipeline publish flow for standard/elevated cases. P2 fixes: charges_dropped in legal framework, suppressed_entities.entity_type CHECK, agent model specs, Typesense suppression note, pipeline diagram updated_
 
 ---
 
@@ -92,20 +92,20 @@ SELECT
   p.id,
   CASE
     WHEN se.id IS NOT NULL THEN '[Name withheld]'
-    WHEN p.name_display_policy = 'redacted' THEN '[Name withheld]'
+    WHEN p.name_display_policy IN ('redacted', 'requires_human_review') THEN '[Name withheld]'
     WHEN p.name_display_policy = 'initials_only' THEN
       array_to_string(ARRAY(
         SELECT left(word, 1) || '.'
         FROM unnest(string_to_array(p.name, ' ')) AS word
       ), ' ')
-    WHEN p.name_display_policy = 'auto' THEN '[Review required]'
-    -- 'auto' cannot be resolved without case context; safe sentinel prevents name leak
+    WHEN p.name_display_policy IN ('auto', 'requires_human_review') THEN '[Review required]'
+    -- 'auto'/'requires_human_review': cannot safely resolve without case context or human approval
     ELSE p.name
   END AS display_name,
   CASE
     WHEN se.id IS NOT NULL THEN NULL
     WHEN p.photo_display_policy IN ('blocked', 'requires_review') THEN NULL
-    WHEN p.name_display_policy = 'auto' THEN NULL -- safe: no photo without resolved name
+    WHEN p.name_display_policy IN ('auto', 'requires_human_review') THEN NULL -- safe: no photo without resolved name
     ELSE p.photo_url
   END AS display_photo_url,
   p.slug,
@@ -126,6 +126,28 @@ FROM people p
 LEFT JOIN suppressed_entities se
   ON se.entity_type = 'people' AND se.entity_id = p.id AND se.lifted_at IS NULL;
 
+-- public_case_tombstones: returns suppressed cases with redacted fields for tombstone pages
+-- Required for rendering "[Case removed]" pages at known URLs after takedowns.
+-- public_cases EXCLUDES suppressed cases — if a route exists, the app must check
+-- public_case_tombstones to serve a proper removal notice instead of a 404.
+CREATE OR REPLACE VIEW public_case_tombstones AS
+SELECT
+  c.id,
+  c.slug,
+  '[Case removed]'::text AS title,
+  NULL::text AS body,
+  NULL::text AS summary,
+  c.review_status,
+  c.deleted_at,
+  c.published_at,
+  se.created_at AS suppressed_at
+FROM cases c
+JOIN suppressed_entities se
+  ON se.entity_type = 'cases' AND se.entity_id = c.id AND se.lifted_at IS NULL
+WHERE c.deleted_at IS NULL;
+-- Usage: app layer checks public_case_tombstones before 404ing on a known slug.
+-- Routing logic: if slug exists in public_case_tombstones → serve 410 Gone with notice.
+
 -- public_cases: hides soft-deleted and suppressed cases from public queries
 CREATE OR REPLACE VIEW public_cases AS
 SELECT c.*
@@ -138,7 +160,9 @@ WHERE c.deleted_at IS NULL
 ```
 Note: Add `WITH (security_barrier = true)` if using Supabase RLS alongside these views for maximum safety.
 
-**`name_display_policy: auto` limitation:** `public_people` resolves `full`, `initials_only`, and `redacted` policies. It does NOT resolve `auto` — `auto` requires case context (`case_people.legal_status`) to evaluate correctly and is therefore case-scoped. Typesense indexing must use `public_case_people` (case-scoped view, defined below) for any query that might include persons with `name_display_policy = 'auto'`. Using `public_people` alone for search indexing risks indexing protected persons under their full name.
+**`public_people` is ADMIN/EDITORIAL USE ONLY — not for public pages.** It returns `'[Review required]'` for `auto` policy persons, which would create confusing UX if used on public-facing routes. Public search, Typesense indexing, and all user-visible pages MUST use `public_case_people` (case-scoped view below). `public_people` is safe for admin dashboards and editorial review tools only.
+
+**`name_display_policy: auto` limitation:** `public_people` resolves `full`, `initials_only`, and `redacted` policies. For `auto`, it returns `'[Review required]'` as a safe sentinel (no name leak). `auto` requires case context (`case_people.legal_status`) to evaluate correctly; use `public_case_people` for full auto-resolution.
 
 ```sql
 -- public_case_people: case-scoped person view that resolves 'auto' name_display_policy
@@ -150,7 +174,7 @@ SELECT
   p.id AS person_id,
   CASE
     WHEN se.id IS NOT NULL THEN '[Name withheld]'
-    WHEN p.name_display_policy = 'redacted' THEN '[Name withheld]'
+    WHEN p.name_display_policy IN ('redacted', 'requires_human_review') THEN '[Name withheld]'
     WHEN p.name_display_policy = 'initials_only' THEN
       array_to_string(ARRAY(
         SELECT left(word, 1) || '.'
@@ -165,7 +189,7 @@ SELECT
         WHEN p.is_minor_at_time_of_crime = true AND cp.charged_as_adult = true THEN p.name
         -- Auto: minor at time + POI/no charges → initials only
         WHEN p.is_minor_at_time_of_crime = true
-             AND cp.legal_status IN ('person_of_interest','no_charges_filed','witness') THEN
+             AND (cp.legal_status IN ('person_of_interest','no_charges_filed') OR cp.case_role = 'witness') THEN
           array_to_string(ARRAY(
             SELECT left(word, 1) || '.'
             FROM unnest(string_to_array(p.name, ' ')) AS word
@@ -371,6 +395,28 @@ $$ LANGUAGE plpgsql;
 --   FOR EACH ROW WHEN (OLD.review_status IS DISTINCT FROM NEW.review_status)
 --   EXECUTE FUNCTION enforce_review_status_transition();
 
+-- Disclaimer gate: block publishing if any living unconvicted person is linked without disclaimer
+CREATE OR REPLACE FUNCTION check_living_person_disclaimer() RETURNS TRIGGER AS $$
+BEGIN
+  IF NEW.review_status = 'published' AND OLD.review_status IS DISTINCT FROM 'published' THEN
+    IF EXISTS (
+      SELECT 1 FROM case_people cp
+      JOIN people p ON p.id = cp.person_id
+      WHERE cp.case_id = NEW.id
+        AND p.is_living = true
+        AND (cp.legal_status IS NULL OR cp.legal_status NOT IN ('convicted','acquitted','exonerated'))
+    ) AND (NEW.disclaimer IS NULL OR trim(NEW.disclaimer) = '') THEN
+      RAISE EXCEPTION
+        'Cannot publish case %: living unconvicted person(s) linked but disclaimer is empty. '
+        'Set cases.disclaimer before publishing.', NEW.id;
+    END IF;
+  END IF;
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+-- CREATE TRIGGER check_living_person_disclaimer BEFORE UPDATE ON cases
+--   FOR EACH ROW EXECUTE FUNCTION check_living_person_disclaimer();
+
 -- community_notes soft-delete: null out parent_id on children when parent is soft-deleted
 -- (ON DELETE SET NULL only fires on hard DELETE; soft delete needs explicit trigger)
 CREATE OR REPLACE FUNCTION null_parent_on_note_soft_delete() RETURNS TRIGGER AS $$
@@ -467,8 +513,9 @@ See `docs/legal-safety-framework.md` for full policy. Key constraints:
 | `case_status` | `unsolved` · `solved_convicted` · `solved_acquitted` · `solved_exonerated` · `ongoing_trial` · `cold_case` · `civil_resolution` · `closed_no_crime` · `closed_suspect_deceased` |
 | `legal_sensitivity` | `standard` · `elevated` · `high` |
 | `review_status` | `draft` · `legal_review` · `qa_review` · `approved` · `published` · `rejected` · `suppressed` |
-| `person_legal_status` | `victim` · `alleged` · `convicted` · `acquitted` · `exonerated` · `charges_dropped` · `person_of_interest` · `no_charges_filed` · `witness` · `detective` · `attorney` · `judge` · `other` |
-| `name_display_policy` | `full` · `initials_only` · `redacted` · `auto` |
+| `case_role` | `victim` · `witness` · `detective` · `attorney` · `judge` · `other` — functional role in the case (who they ARE in relation to it) |
+| `person_legal_status` | `alleged` · `convicted` · `acquitted` · `exonerated` · `charges_dropped` · `person_of_interest` · `no_charges_filed` — legal standing (what the legal system has determined). Nullable: `NULL` for persons whose only relationship is a functional role (detective, attorney, judge, victim with no charges). |
+| `name_display_policy` | `full` · `initials_only` · `redacted` · `auto` · `requires_human_review` |
 | `photo_display_policy` | `allowed` · `blocked` · `requires_review` |
 | `app_role` | `user` · `moderator` · `admin` |
 | `event_type` | `crime_event` · `discovery` · `arrest` · `indictment` · `trial_start` · `verdict` · `sentencing` · `appeal_filed` · `appeal_ruling` · `release` · `death` · `media_coverage` · `other` |
@@ -507,22 +554,28 @@ See `docs/legal-safety-framework.md` for full policy. Key constraints:
 
 ---
 
-**Controlled text fields** (stored as `text` or `text[]` with CHECK constraints, not enums):
+**Controlled text fields** (stored as `text` or `text[]` with DB-level CHECK constraints):
+These are enforced at the Postgres level — they are NOT soft guidance. The migration SQL must
+include these as `ADD CONSTRAINT` statements on the tables specified below:
 
 ```sql
--- content_warnings array
-CHECK (content_warnings <@ ARRAY['child_victim','sexual_violence','infant_victim',
-  'family_violence','mass_casualty','graphic_imagery_risk']::text[])
+-- cases.content_warnings (text[]) — applied on CREATE TABLE cases
+ALTER TABLE cases ADD CONSTRAINT cases_content_warnings_check
+  CHECK (content_warnings <@ ARRAY['child_victim','sexual_violence','infant_victim',
+    'family_violence','mass_casualty','graphic_imagery_risk']::text[]);
 
--- primary_weapon
-CHECK (primary_weapon IN ('firearm','knife','blunt_object','poison',
-  'strangulation','unknown','other'))
+-- cases.primary_weapon (text, nullable) — applied on CREATE TABLE cases
+ALTER TABLE cases ADD CONSTRAINT cases_primary_weapon_check
+  CHECK (primary_weapon IN ('firearm','knife','blunt_object','poison',
+    'strangulation','unknown','other'));
 
--- entity_sources.entity_type
-CHECK (entity_type IN ('cases','people','timeline_events','evidence','charges','appeals'))
+-- entity_sources.entity_type (text) — applied on CREATE TABLE entity_sources
+ALTER TABLE entity_sources ADD CONSTRAINT entity_sources_entity_type_check
+  CHECK (entity_type IN ('cases','people','timeline_events','evidence','charges','appeals'));
 
--- is_living consistency with dod
-CHECK (dod IS NULL OR is_living IS NOT TRUE)
+-- people.is_living consistency with dod — applied on CREATE TABLE people
+ALTER TABLE people ADD CONSTRAINT people_is_living_dod_check
+  CHECK (dod IS NULL OR is_living IS NOT TRUE);
 ```
 
 ---
@@ -678,7 +731,9 @@ PK: `(case_id, tag_id)`
 | `notes` | text | |
 
 PK: `(case_id_a, case_id_b)`
-CONSTRAINT: `CHECK (case_id_a < case_id_b)` — prevents `(A,B)` and `(B,A)` duplicates. Queries: `WHERE case_id_a = X OR case_id_b = X`.
+CONSTRAINT: `CHECK (case_id_a < case_id_b)` — prevents `(A,B)` and `(B,A)` duplicates.
+**Required write contract:** Always canonicalize before insert: `case_id_a = LEAST(uuid1, uuid2)`, `case_id_b = GREATEST(uuid1, uuid2)`. PostgreSQL UUID comparison is lexicographic. Any service writing relationships must sort the two UUIDs before insert — failure to do so causes intermittent constraint violations. Recommend wrapping in a helper function `upsert_related_case(uuid, uuid, relationship_type)` that canonicalizes automatically.
+Query pattern: `WHERE case_id_a = X OR case_id_b = X`.
 
 ---
 
@@ -703,7 +758,7 @@ CONSTRAINT: `CHECK (case_id_a < case_id_b)` — prevents `(A,B)` and `(B,A)` dup
 | `id` | uuid | PK |
 | `case_id` | uuid | NOT NULL, FK → cases (ON DELETE CASCADE) |
 | `date` | date | |
-| `date_precision` | enum | NOT NULL DEFAULT `approximate` — `exact` · `approximate` · `year_only`. CHECK: `(date IS NOT NULL OR date_precision = 'approximate')` — when `date` is NULL (unknown), precision must be `approximate`. Agent A must always set this field; precision `exact` with a NULL date is invalid. |
+| `date_precision` | enum | NOT NULL DEFAULT `approximate` — `exact` · `approximate` · `year_only`. CHECK: `(date IS NOT NULL OR date_precision = 'approximate')` — when `date` is NULL (unknown), precision must be `approximate`. Semantics: `exact` = date is confirmed as stated; `approximate` = date is estimated/sourced from secondary reporting (UI renders as "circa [date]"); `year_only` = only the year is known (UI renders as "[year]"). A real date with `approximate` precision is valid — it means "approximately this date" not "unknown date". Agent A must always set this explicitly; never leave at default without intention. |
 | `event_type` | enum | `crime_event` · `discovery` · `arrest` · `indictment` · `trial_start` · `verdict` · `sentencing` · `appeal_filed` · `appeal_ruling` · `release` · `death` · `media_coverage` · `other` |
 | `title` | text | |
 | `description` | text | |
@@ -724,15 +779,15 @@ CONSTRAINT: `CHECK (case_id_a < case_id_b)` — prevents `(A,B)` and `(B,A)` dup
 | `slug` | text | NOT NULL, UNIQUE, URL-safe. CHECK (`slug ~ '^[a-z0-9]+(-[a-z0-9]+)*$'`) — same pattern as cases.slug. |
 | `name` | text | NOT NULL |
 | `aliases` | text[] | NOT NULL DEFAULT '{}' |
-| `primary_known_role` | `person_legal_status` enum | **Display hint only.** Source of truth is `case_people.legal_status`. Same enum type as `case_people.legal_status`. |
+| `primary_known_role` | `case_role` enum | **Display hint only.** Captures the person's most common role across cases (e.g., `detective`, `attorney`). Not a legal status. |
 | `dob` | date | nullable |
 | `dod` | date | nullable |
 | `bio` | text | |
 | `photo_url` | text | |
 | `is_living` | bool | nullable — null = unknown. `true` + not convicted → aggressive disclaimer required. CHECK: `(dod IS NULL OR is_living IS NOT TRUE)` — person cannot have a date of death and be marked living. |
 | `is_minor_at_time_of_crime` | bool | nullable — under 18 when the crime occurred |
-| `is_minor_currently` | bool | nullable — still a minor today. **Auto-update mechanism:** Agent D nightly cron checks all `people` rows where `is_minor_currently = true` and `dob IS NOT NULL`; if `CURRENT_DATE - dob >= 18 years`, sets `is_minor_currently = false` and logs a `moderation_actions` record (`action_type: edited`, `agent_source: agent_d`, `metadata: { "field": "is_minor_currently", "from": true, "to": false }`). Editors can override by setting explicit `name_display_policy` + `photo_display_policy` values (not `auto`). |
-| `name_display_policy` | enum | `full` · `initials_only` · `redacted` · `auto` — default `auto` (enforces minor display rules) |
+| `is_minor_currently` | bool | nullable — still a minor today. **Auto-update mechanism:** Agent D nightly cron detects when `is_minor_currently = true` persons turn 18. On detection, Agent D does NOT auto-flip the flag. Instead: (1) Agent D sets `name_display_policy = 'requires_human_review'` (sentinel value — prevents display), (2) logs a `moderation_actions` record (`action_type: 'flagged'`, `agent_source: 'agent_d'`, `metadata: { "reason": "minor_aged_out", "dob": "...", "age": 18 }`), (3) alerts Carmen directly. Carmen reviews the case and either sets `name_display_policy = 'full'` (clear for display) or `name_display_policy = 'redacted'` (keep protected). Only after Carmen acts does `is_minor_currently` get set to false. **No auto-flip without human review.** Add `'requires_human_review'` to `name_display_policy` enum. The `public_case_people` view treats `requires_human_review` as `'[Review required]'` (same as auto sentinel). |
+| `name_display_policy` | enum | `full` · `initials_only` · `redacted` · `auto` · `requires_human_review` — default `auto`. `auto` = system resolves based on minor flags + case role. `requires_human_review` = sentinel set by Agent D when a minor ages out — blocks display until human clears it. |
 | `photo_display_policy` | enum | `allowed` · `blocked` · `requires_review` — default `requires_review` |
 | `links` | jsonb | `{ "wikipedia": "...", "news": [...] }` |
 | `created_at` | timestamptz | |
@@ -747,7 +802,8 @@ Surrogate PK provides a stable FK target for `charges` and `appeals` (they refer
 | `id` | uuid | PK (surrogate) |
 | `case_id` | uuid | NOT NULL, FK → cases (ON DELETE CASCADE) |
 | `person_id` | uuid | FK → people (ON DELETE RESTRICT) |
-| `legal_status` | enum | NOT NULL — **Display label** (denormalized from `charges`). Values: `victim` · `alleged` · `convicted` · `acquitted` · `exonerated` · `charges_dropped` · `person_of_interest` · `no_charges_filed` · `witness` · `detective` · `attorney` · `judge` · `other`. Agent B must verify this label is consistent with `charges.disposition`. The `charges` table is the structured legal record (source of truth); this field is the UI shorthand. |
+| `case_role` | `case_role` enum | NOT NULL — functional role in this case: `victim` · `witness` · `detective` · `attorney` · `judge` · `other`. Who this person IS in relation to the case. |
+| `legal_status` | `person_legal_status` enum | **Nullable** — legal standing: `alleged` · `convicted` · `acquitted` · `exonerated` · `charges_dropped` · `person_of_interest` · `no_charges_filed`. NULL for persons whose only relationship is a functional role (detective, attorney, judge, victim with no charges). **Display label** (denormalized from `charges`). The `charges` table is the structured source of truth; this field is the UI shorthand. Agent B must verify this label is consistent with `charges.disposition`. CHECK: `(case_role NOT IN ('detective','attorney','judge') OR legal_status IS NULL)` — detectives/attorneys/judges do not have legal standing in the case. |
 | `notes` | text | Case-specific context |
 | `charged_as_adult` | bool | NOT NULL DEFAULT false — true if this minor was tried in adult court. Required for minor display rules: `is_minor_at_time_of_crime = true` + `charged_as_adult = true` → `name_display_policy` may be `full`. The `public_case_people` view uses this field to resolve `name_display_policy: auto` for minors charged as adults. |
 | `is_primary` | bool | NOT NULL DEFAULT false — flags the most prominent person(s) for a case. **Multiple `is_primary = true` rows per case are intentionally allowed** (e.g. a case with two co-defendants can have both flagged). No UNIQUE constraint. UI should display all primary-flagged persons prominently. If editorial intent is "exactly one primary", enforce at application layer, not DB. |
@@ -781,7 +837,7 @@ UNIQUE: `(case_id, person_id)` — **one row per person per case**. `legal_statu
 
 | Field | Type | Notes |
 |-------|------|-------|
-| `case_id` | uuid | NOT NULL, FK → cases (CASCADE) |
+| `case_id` | uuid | NOT NULL, FK → cases (ON DELETE CASCADE) |
 | `agency_id` | uuid | FK → agencies (RESTRICT) |
 | `role` | text | e.g. `lead investigator` · `supporting` |
 
@@ -831,7 +887,7 @@ Supports group interviews.
 
 | Field | Type | Notes |
 |-------|------|-------|
-| `interview_id` | uuid | FK → interviews (CASCADE) |
+| `interview_id` | uuid | FK → interviews (ON DELETE CASCADE) |
 | `person_id` | uuid | FK → people (RESTRICT) |
 | `role` | text | `interviewee` · `interviewer` |
 
@@ -877,8 +933,8 @@ PK: `(interview_id, person_id)`
 
 | Field | Type | Notes |
 |-------|------|-------|
-| `case_id` | uuid | NOT NULL, FK → cases (CASCADE) |
-| `episode_id` | uuid | FK → podcast_episodes (CASCADE) |
+| `case_id` | uuid | NOT NULL, FK → cases (ON DELETE CASCADE) |
+| `episode_id` | uuid | FK → podcast_episodes (ON DELETE CASCADE) |
 | `relevance` | enum | `primary` · `mentions` |
 
 PK: `(case_id, episode_id)`
@@ -908,7 +964,7 @@ PK: `(case_id, episode_id)`
 
 | Field | Type | Notes |
 |-------|------|-------|
-| `case_id` | uuid | NOT NULL, FK → cases (CASCADE) |
+| `case_id` | uuid | NOT NULL, FK → cases (ON DELETE CASCADE) |
 | `show_id` | uuid | FK → tv_shows (ON DELETE CASCADE) |
 | `episode_refs` | jsonb | Array of `{ "season": 2, "episode": 5 }` |
 | `notes` | text | |
@@ -948,7 +1004,7 @@ PK: `(case_id, article_id)`
 | Field | Type | Notes |
 |-------|------|-------|
 | `id` | uuid | PK |
-| `case_id` | uuid | NOT NULL, FK → cases (CASCADE) |
+| `case_id` | uuid | NOT NULL, FK → cases (ON DELETE CASCADE) |
 | `subreddit` | text | e.g. `r/JonBenetRamsey` |
 | `description` | text | |
 | `member_count` | int | Cached, refreshed weekly |
@@ -968,7 +1024,7 @@ Retention: keep top 50 posts per case by score. Upsert on `post_id` UNIQUE on ea
 | Field | Type | Notes |
 |-------|------|-------|
 | `id` | uuid | PK |
-| `case_id` | uuid | NOT NULL, FK → cases (CASCADE) |
+| `case_id` | uuid | NOT NULL, FK → cases (ON DELETE CASCADE) |
 | `subreddit_id` | uuid | FK → case_subreddits (SET NULL on delete) — null if post from non-curated subreddit |
 | `post_id` | text | UNIQUE — Reddit base36 ID, deduplication key |
 | `title` | text | |
@@ -1088,7 +1144,12 @@ Links sources to any entity (case, person, timeline event, evidence, etc.) with 
 
 PK: `(source_id, entity_type, entity_id)`
 
-**Orphan cleanup policy:** `entity_sources.entity_id` has no Postgres FK (polymorphic reference). When a referenced entity is deleted or soft-deleted, `entity_sources` rows must be cleaned up manually. Policy: (a) Agent D nightly scan flags any `entity_sources` row where the referenced `entity_id` no longer exists in the target table — treat as data integrity error; (b) Hard deletes cascade from `cases` → `timeline_events` but NOT into `entity_sources` (no FK). App layer must issue `DELETE FROM entity_sources WHERE entity_type='timeline_events' AND entity_id=...` when deleting timeline events. Suppressed entities: do NOT delete their `entity_sources` records — suppression is display-only, not data deletion.
+**Orphan cleanup policy (all polymorphic tables):** The following tables have no Postgres FK because they reference multiple parent tables: `entity_sources`, `upvotes`, `content_reports`, `content_takedown_requests`, `suppressed_entities`. Orphan cleanup applies to all of them:
+- **entity_sources:** Agent D nightly scan flags rows where `entity_id` no longer exists in the target table. Hard deletes from parent tables: app layer must DELETE from entity_sources before (or in the same transaction as) any hard delete of a referenced entity.
+- **upvotes:** Rows for soft-deleted entities are intentionally preserved (historical count). Rows for hard-deleted entities: app layer must DELETE from upvotes before hard-deleting the parent. The nightly reconciliation cron verifies counts match surviving rows.
+- **content_reports, content_takedown_requests:** App layer must clean up when referenced entity is hard-deleted. Agent D nightly scan flags orphans.
+- **suppressed_entities:** Do NOT delete records for suppressed entities — suppression is display-only, not data deletion. Only delete the `suppressed_entities` row when `lifted_at` is set and Carmen confirms removal.
+Hard deletes are rare (cases are never hard-deleted; block_case_hard_delete trigger enforces this). The highest-risk path is timeline_events: cascade from cases.deleted_at does NOT propagate to entity_sources (no FK). App layer must handle this.
 
 ---
 
@@ -1160,7 +1221,7 @@ PK: `(case_id, book_id)`
 
 PK: `(user_id, entity_type, entity_id)` — naturally prevents double-upvotes.
 
-CONSTRAINT: `CHECK (entity_type IN ('community_notes'))` — **canonical list of upvotable tables**. Each table in this list MUST have `upvote_count int NOT NULL DEFAULT 0 CHECK (upvote_count >= 0)` and be covered by the nightly reconciliation cron. To make a new entity upvotable: (1) add `upvote_count` to the table, (2) add its name to this CHECK, (3) add a nightly reconciliation query in `docs/data-pipeline.md`. Do not add a table to this CHECK without also adding `upvote_count` — the trigger will fail at runtime with "column does not exist".
+CONSTRAINT: `CHECK (entity_type IN ('community_notes'))` — **MVP scope: only `community_notes` are upvotable.** Do not use the dynamic trigger for any other entity type until this CHECK is extended. The CHECK and the trigger scope MUST stay in sync — adding a table to the trigger without adding to this CHECK causes immediate write failures (no rows can be inserted). Extension procedure: (1) add `upvote_count int NOT NULL DEFAULT 0 CHECK (upvote_count >= 0)` to the new table, (2) add the new entity_type to this CHECK (migration required), (3) add a nightly reconciliation query to `docs/data-pipeline.md`.
 
 ### `community_notes`
 
@@ -1253,7 +1314,7 @@ Kill switch. Suppressed person → renders as "[Name withheld]" site-wide. Suppr
 | `reason` | enum | NOT NULL — `legal_demand` · `court_order` · `minor_privacy` · `victim_request` · `family_request` · `editorial` |
 | `takedown_request_id` | uuid | FK → content_takedown_requests (nullable) |
 | `suppressed_by` | uuid | FK → profiles (SET NULL) — nullable; null when suppression is agent-initiated (e.g. Agent D auto-suppress) |
-| `agent_source` | text | nullable — CHECK (`agent_source IN ('agent_a','agent_b','agent_c','agent_d','human','system')`). Also subject to: CHECK `(suppressed_by IS NOT NULL OR agent_source IS NOT NULL)` — same mutual non-null pattern as `moderation_actions`. |
+| `agent_source` | text | nullable — CHECK (`agent_source IN ('agent_a','agent_b','agent_c','agent_d','human','system')`). Also subject to: CHECK `(suppressed_by IS NOT NULL OR agent_source IS NOT NULL)` — same at-least-one-non-null pattern as `moderation_actions`. |
 | `suppressed_at` | timestamptz | NOT NULL DEFAULT now() |
 | `lifted_at` | timestamptz | nullable — if suppression was later reversed |
 | `lift_reason` | text | nullable |

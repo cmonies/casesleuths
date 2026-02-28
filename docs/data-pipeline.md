@@ -230,10 +230,28 @@ NEEDS_REVISION (vocab/label issue only — no body rewrite needed) → set `revi
 **Not required for:** `standard` and `elevated` cases — auto-published after Agent C approval
 
 ### High-sensitivity cases (human required)
-Carmen (or trusted editor) reviews Agent C's score report, checks the case page live, then:
-- Sets `published_at = now()`
-- Sets `review_status: published`
-- Logs to `moderation_actions` (`action_type: approved`, `agent_source: 'human'`, `reason: "human_final_approval"`)
+Carmen (or trusted editor) reviews Agent C's score report, checks the case page live, then must execute **both steps in order**:
+
+**Step 1 — Create the approval record (required before Step 2):**
+```sql
+INSERT INTO moderation_actions (
+  entity_type, entity_id, action_type, agent_source, moderator_id, reason
+) VALUES (
+  'cases', '<case_id>', 'approved', 'human', '<auth_user_id>',
+  'human_final_approval'
+);
+```
+This is a DB-level requirement, not optional. The `block_high_sensitivity_autopublish` trigger
+blocks publishing unless this record exists. The state machine trigger writes `action_type='edited'`
+for status transitions — the `'approved'` record must be created by the app before the transition.
+
+**Step 2 — Set published status:**
+```sql
+UPDATE cases SET review_status = 'published', published_at = now()
+WHERE id = '<case_id>';
+```
+This fires the `block_high_sensitivity_autopublish` trigger, which checks for the Step 1 record.
+If Step 1 was skipped, the UPDATE raises an exception.
 
 ### Standard/elevated cases (auto-publish)
 After Agent C sets `review_status: approved`:
