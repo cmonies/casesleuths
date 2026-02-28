@@ -171,6 +171,7 @@ FAIL → set `review_status: draft`, increment `cases.revision_count`, log viola
 - Living acquitted person with no disclaimer
 - Minor with `name_display_policy: full` and not charged as adult
 - `case_people.legal_status` directly contradicts `charges.disposition`
+- `case_people.legal_status = 'charges_dropped'` → must have at least 1 `charges` row with `disposition: charges_dropped`. No charges row = P0 (data integrity violation — status must be backed by a structured record).
 
 ---
 

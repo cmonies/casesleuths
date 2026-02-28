@@ -319,7 +319,7 @@ Case
 | `location_coords` | point | lat/lng |
 | `date_start` | date | |
 | `date_end` | date | nullable |
-| `year` | int | Generated from `date_start` (or manual override) — for /year/1994 SEO pages |
+| `year` | int | **Application-managed** (not a Postgres GENERATED ALWAYS AS column — Supabase does not reliably support generated columns on all plan tiers). Set by Agent A on insert from `EXTRACT(YEAR FROM date_start)`. Update trigger recommended: `BEFORE UPDATE ON cases` → `NEW.year = EXTRACT(YEAR FROM NEW.date_start) IF NEW.year IS NULL`. Nullable — some cold cases lack a precise date. Used for /year/1994 SEO pages. |
 | `summary` | text | |
 | `body` | text | Plain Markdown |
 | `disclaimer` | text | Shown prominently — e.g. "No one has been charged in this case." |
@@ -436,7 +436,7 @@ CONSTRAINT: `CHECK (case_id_a < case_id_b)` — prevents `(A,B)` and `(B,A)` dup
 | `photo_url` | text | |
 | `is_living` | bool | nullable — null = unknown. `true` + not convicted → aggressive disclaimer required |
 | `is_minor_at_time_of_crime` | bool | nullable — under 18 when the crime occurred |
-| `is_minor_currently` | bool | nullable — still a minor today (derived from DOB, can be overridden) |
+| `is_minor_currently` | bool | nullable — still a minor today. **Auto-update mechanism:** Agent D nightly cron checks all `people` rows where `is_minor_currently = true` and `dob IS NOT NULL`; if `CURRENT_DATE - dob >= 18 years`, sets `is_minor_currently = false` and logs a `moderation_actions` record (`action_type: edited`, `agent_source: agent_d`, `metadata: { "field": "is_minor_currently", "from": true, "to": false }`). Editors can override by setting explicit `name_display_policy` + `photo_display_policy` values (not `auto`). |
 | `name_display_policy` | enum | `full` · `initials_only` · `redacted` · `auto` — default `auto` (enforces minor display rules) |
 | `photo_display_policy` | enum | `allowed` · `blocked` · `requires_review` — default `requires_review` |
 | `links` | jsonb | `{ "wikipedia": "...", "news": [...] }` |
@@ -942,6 +942,8 @@ Kill switch. Suppressed person → renders as "[Name withheld]" site-wide. Suppr
 
 PARTIAL UNIQUE INDEX: `CREATE UNIQUE INDEX ON suppressed_entities (entity_type, entity_id) WHERE lifted_at IS NULL` — allows re-suppression after a suppression has been lifted. No full `UNIQUE` constraint (would block INSERT after lift). No `updated_at` — immutable; use `lifted_at` to record reversal.
 
+**Unsuppression flow:** To lift suppression: (1) set `lifted_at = now()` and `lift_reason` on the existing row — **never delete** it (audit trail); (2) log a `moderation_actions` record (`action_type: unsuppressed`, `agent_source: human`, `metadata: { reason }`); (3) trigger ISR revalidation on affected case pages; (4) re-index in Typesense. Entity can be re-suppressed after a lift by inserting a new `suppressed_entities` row (partial index allows this). **Path back from `suppressed` review_status:** admin manually sets `review_status → legal_review` and logs the action. Only admins can un-suppress cases. `suppressed → any` transition is admin-only, not pipeline-accessible.
+
 ### `moderation_actions`
 
 Immutable audit log of every moderation decision. Required for legal defense.
@@ -950,9 +952,7 @@ Immutable audit log of every moderation decision. Required for legal defense.
 |-------|------|-------|
 | `id` | uuid | PK |
 | `moderator_id` | uuid | FK → profiles (SET NULL) — nullable; null when action is from an automated agent |
-| `agent_source` | text | nullable — `agent_a` · `agent_b` · `agent_c` · `agent_d` · `human`. Set when `moderator_id` is null. |
-
-CHECK: `(moderator_id IS NOT NULL OR agent_source IS NOT NULL)` — at least one attribution required. Prevents orphaned audit records.
+| `agent_source` | text | nullable — `agent_a` · `agent_b` · `agent_c` · `agent_d` · `human` · `system` (automated cron/trigger jobs). Set when `moderator_id` is null. CHECK: `(moderator_id IS NOT NULL OR agent_source IS NOT NULL)` — at least one attribution required. Prevents orphaned audit records. |
 | `entity_type` | text | NOT NULL |
 | `entity_id` | uuid | NOT NULL |
 | `action_type` | enum | NOT NULL — `approved` · `rejected` · `edited` · `deleted` · `restored` · `suppressed` · `unsuppressed` · `locked` · `unlocked` |
@@ -1026,11 +1026,7 @@ PK: `(user_id, media_type, media_id)`
 | `cases` | `state_code` | btree | /state/california pages |
 | `cases` | `year` | btree | /year/1994 pages |
 | `cases` | `jurisdiction_id` | btree | FK join |
-| `charges` | `case_id` | btree | FK join |
-| `charges` | `person_id` | btree | Charges per person |
 | `charges` | `disposition` | btree | Filter by outcome |
-| `appeals` | `case_id` | btree | FK join |
-| `appeals` | `person_id` | btree | Appeals per person |
 | `appeals` | `status` | partial (`WHERE status = 'pending'`) | Active appeals |
 | `entity_sources` | `(entity_type, entity_id)` | btree | Sources for an entity |
 | `case_series` | `slug` | UNIQUE | Series page lookups |
@@ -1105,7 +1101,7 @@ SET upvote_count = (
 |---|------|--------|-------------------|-------|
 | 1 | JonBenét Ramsey | `unsolved` | `high` | No charges ever filed. All persons = `no_charges_filed` or `person_of_interest` |
 | 2 | Zodiac Killer | `unsolved` | `standard` | No named charged individuals |
-| 3 | Gabby Petito | `closed_suspect_deceased` | `standard` | Brian Laundrie = `alleged` (died before trial) |
+| 3 | Gabby Petito | `closed_suspect_deceased` | `standard` | Brian Laundrie = `person_of_interest` — was named as POI, **never formally charged** with Petito's murder before his death. `alleged` requires formal charges; this is a POI case only. |
 | 4 | OJ Simpson | `civil_resolution` | `elevated` | Simpson `acquitted` (criminal), `civil_resolution` (civil). Simpson deceased June 2024. Goldman/Brown estates protective. |
 | 5 | Laci Peterson | `solved_convicted` | `standard` | Scott Peterson = `convicted`. Note: appealing — add note field. |
 | 6 | Ted Bundy | `solved_convicted` | `standard` | `convicted`, deceased |
