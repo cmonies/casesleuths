@@ -106,8 +106,10 @@ SELECT
       ), ' ')
     WHEN p.name_display_policy = 'auto' THEN '[Review required]'
     -- 'auto': cannot safely resolve without case context; use public_case_people instead
-    -- Note: 'requires_human_review' is already caught by the IN('redacted','requires_human_review') branch above
-    ELSE p.name
+    WHEN p.name_display_policy = 'full' THEN p.name
+    ELSE '[Name withheld]'
+    -- ELSE is fail-closed: unknown/future policy values return '[Name withheld]' not the real name.
+    -- Admin tools needing the real name must query base tables via service-role.
   END AS display_name, -- comma required: SQL SELECT list
   -- Note: public_people is ADMIN/EDITORIAL only. 'auto' returns '[Review required]' — admin tools
   -- should show the real name via a service-role query when needed for editorial review.
@@ -229,7 +231,7 @@ SELECT
     WHEN p.name_display_policy = 'auto' THEN
       CASE
         -- 1. Minor charged as adult → full name (check FIRST — overrides all other minor rules)
-        WHEN p.is_minor_at_time_of_crime = true AND cp.charged_as_adult = true THEN p.name
+        WHEN p.is_minor_at_time_of_crime = true AND cp.charged_as_adult IS TRUE THEN p.name
         -- 2. Currently a minor and not convicted/acquitted/exonerated → withhold name
         WHEN p.is_minor_currently = true
              AND (cp.legal_status IS NULL OR cp.legal_status NOT IN ('convicted','acquitted','exonerated'))
@@ -266,7 +268,7 @@ SELECT
     -- Block photo whenever name is being withheld by auto-policy (minor protection)
     WHEN p.name_display_policy = 'auto' AND (
       p.is_minor_currently = true
-      OR (p.is_minor_at_time_of_crime = true AND NOT cp.charged_as_adult)
+      OR (p.is_minor_at_time_of_crime = true AND cp.charged_as_adult IS NOT TRUE)
     ) THEN NULL
     ELSE p.photo_url
   END AS display_photo_url,
@@ -514,9 +516,13 @@ BEGIN
       JOIN people p ON p.id = cp.person_id
       WHERE cp.case_id = NEW.id
         AND p.is_living = true
-        -- Exclude pure functional roles — detectives/attorneys/judges/witnesses have no legal standing
-        -- Victims (case_role='victim') with NULL legal_status ARE checked (could be defamatory)
-        AND cp.case_role NOT IN ('detective', 'attorney', 'judge', 'witness')
+        -- Exclude purely institutional roles only: detectives, attorneys, judges act in official
+        -- institutional capacity. Their involvement is public record; defamation risk is minimal.
+        -- Witnesses ARE included — they are private individuals whose reputation can be harmed by
+        -- association with a case. A living witness with no conviction needs the same disclaimer
+        -- protection as any other living unconvicted person.
+        -- Victims with NULL legal_status ARE also checked (framing can be defamatory).
+        AND cp.case_role NOT IN ('detective', 'attorney', 'judge')
         AND (cp.legal_status IS NULL OR cp.legal_status NOT IN ('convicted','acquitted','exonerated'))
     ) AND (NEW.disclaimer IS NULL OR trim(NEW.disclaimer) = '') THEN
       RAISE EXCEPTION
@@ -712,9 +718,12 @@ ALTER TABLE cases ADD CONSTRAINT cases_primary_weapon_check
 
 -- entity_sources.entity_type (text) — applied on CREATE TABLE entity_sources
 ALTER TABLE entity_sources ADD CONSTRAINT entity_sources_entity_type_check
-  CHECK (entity_type IN ('cases','people','timeline_events','evidence','charges','appeals','community_notes','community_corrections'));
-  -- community_notes and community_corrections added: editors can cite sources for corrections.
-  -- The "any entity" wording in the table description is intentional — expand this CHECK as needed.
+  CHECK (entity_type IN ('cases','people','timeline_events','evidence','charges','appeals'));
+  -- INTENTIONALLY excludes community_notes, community_corrections, content_reports, moderation_actions.
+  -- Rationale: entity_sources is the citation trail for factual claims made BY the platform.
+  -- community_notes/corrections are user-generated and cite existing sources — they don't GET cited.
+  -- See rationale note in entity_sources table definition for full explanation.
+  -- Do not extend without evaluating whether the new entity type makes platform-owned factual claims.
 
 -- people.is_living consistency with dod — applied on CREATE TABLE people
 ALTER TABLE people ADD CONSTRAINT people_is_living_dod_check
@@ -838,7 +847,7 @@ Case
 | `id` | uuid | PK |
 | `old_slug` | text | UNIQUE |
 | `new_case_id` | uuid | FK → cases.id (ON DELETE CASCADE) — canonical reference, immune to slug changes |
-| `new_slug` | text | NOT NULL — denormalized cache of the current `cases.slug`. **Initialization:** on INSERT into `slug_redirects`, application layer must set `new_slug = (SELECT slug FROM cases WHERE id = new_case_id)`. The `sync_slug_redirect` trigger only fires on `cases.slug` UPDATE — it does not initialize `new_slug` on row creation. Supabase function or app-layer helper required for INSERT. |
+| `new_slug` | text | NOT NULL — denormalized cache of the current `cases.slug`. **Initialization:** automatically set by `init_slug_redirect_new_slug` BEFORE INSERT trigger — fetches `cases.slug` for `new_case_id` and raises an exception if case not found. `sync_slug_redirect` trigger keeps it current on `cases.slug` UPDATE. App layer does not need to set this explicitly. |
 | `created_at` | timestamptz | |
 | `updated_at` | timestamptz | |
 
@@ -1178,7 +1187,7 @@ Retention: keep top 50 posts per case by score. Upsert on `post_id` UNIQUE on ea
 |-------|------|-------|
 | `id` | uuid | PK |
 | `case_id` | uuid | NOT NULL, FK → cases (ON DELETE CASCADE) |
-| `subreddit_id` | uuid | FK → case_subreddits (SET NULL on delete) — null if post from non-curated subreddit |
+| `subreddit_id` | uuid | FK → case_subreddits (SET NULL on delete) — null if post from non-curated subreddit. **Cross-case constraint:** `subreddit_id` must belong to the same `case_id` as this post. Migration must add: `CHECK` is not expressible as a simple constraint (requires subquery); enforce via trigger or application layer. Agent A must only set `subreddit_id` from rows in `case_subreddits` where `case_subreddits.case_id = case_reddit_posts.case_id`. |
 | `post_id` | text | UNIQUE — Reddit base36 ID, deduplication key |
 | `title` | text | |
 | `subreddit` | text | Denormalized for display |
@@ -1375,7 +1384,7 @@ PK: `(case_id, book_id)`
 |-------|------|-------|
 | `user_id` | uuid | FK → profiles (ON DELETE CASCADE) |
 | `entity_type` | text | Table name — must match an actual table for trigger dispatch |
-| `entity_id` | uuid | No Postgres FK (polymorphic) — orphan cleanup via trigger on soft delete |
+| `entity_id` | uuid | No Postgres FK (polymorphic) — **no automatic orphan cleanup trigger.** Nightly reconciliation cron recomputes `upvote_count` from live rows only; orphaned upvote rows (parent soft-deleted) do not affect count accuracy since the reconciliation query JOINs to the parent table. Agent D flags orphan count mismatches. App layer should block new upvotes on soft-deleted entities (check `deleted_at` before insert). |
 | `created_at` | timestamptz | |
 
 PK: `(user_id, entity_type, entity_id)` — naturally prevents double-upvotes.
