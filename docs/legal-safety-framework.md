@@ -52,7 +52,8 @@ Every case and every person in the case must carry a legal status label. This is
 - `alleged` (charged but not convicted)
 - `person_of_interest` (named by investigators, not formally charged — if truly unnamed, omit from person records)
 - `witness`
-- `no_charges_filed` (named in media/podcasts, never charged)
+- `charges_dropped` (was formally charged; charges subsequently dropped or dismissed before trial — distinct from acquitted and from no_charges_filed)
+- `no_charges_filed` (named in media/podcasts, never formally charged)
 
 **UI requirement:** Person status must be visible on case pages. Never just "killer" — always "convicted of murder" or "alleged to have..." Language matters legally.
 

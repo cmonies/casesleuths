@@ -1,6 +1,6 @@
 # CaseSleuths — Data Schema
 
-_v0.8 · 2026-02-28 — P0 fixes: resolved case_people UNIQUE contradiction (one row per person per case), fixed user_media_progress status enum mismatch, fixed suppressed_entities index entry in indexes table, declared charges composite FK explicitly, added charges_dropped to person_legal_status enum, added NOT NULL declarations on all critical fields, added community_notes.parent_id ON DELETE SET NULL, added upvote_count CHECK >= 0 + trigger clamp, added content_reports.entity_type CHECK, added review_status transition rules, clarified Agent C failure routing, added moderation_actions.agent_source field, added revision_count to cases_
+_v0.9 · 2026-02-28 — P0 fixes: added qa_review→legal_review transition, fixed upvote trigger GREATEST clamp. P1 fixes: dropped redundant case_id/person_id from charges/appeals (join through case_people only), moderation_actions mutual non-null CHECK, Agent D stale pipeline + auto-suppress P0 policy, charges/appeals case_person_id indexes, sources.url UNIQUE, minimum source coverage publish gate, pipeline publish flow for standard/elevated cases. P2 fixes: charges_dropped in legal framework, suppressed_entities.entity_type CHECK, agent model specs, Typesense suppression note, pipeline diagram updated_
 
 ---
 
@@ -80,6 +80,10 @@ Reddit's model (and ours): **optimistic updates + Supabase Realtime push**.
 
 **Ongoing trial lock:** Cases with `status = 'ongoing_trial'` have community contributions (notes, corrections, upvotes) blocked via RLS. No annotations on active criminal proceedings.
 
+**Minimum source coverage gate:** A publish trigger blocks `review_status = 'published'` unless the case has at least: 1 source in `entity_sources` linked to `cases`, and 1 source linked to each `timeline_event` in the case. Enforced at DB level — not process-only.
+
+**Typesense indexing + suppression:** All Typesense indexing jobs must JOIN against `suppressed_entities WHERE lifted_at IS NULL` and redact suppressed entities before indexing. Suppressed persons must not appear in search results even if the case page shows "[Name withheld]". Indexing queries should use the `public_people` view (TODO: define RLS views).
+
 **Drift insurance:** Nightly reconciliation cron recomputes all `upvote_count` values from the `upvotes` table directly — cheap insurance against trigger edge cases (manual SQL, pg_restore, bulk imports).
 
 ```sql
@@ -101,7 +105,8 @@ BEGIN
     EXECUTE format('UPDATE %I SET upvote_count = upvote_count + 1 WHERE id = $1', NEW.entity_type)
       USING NEW.entity_id;
   ELSIF TG_OP = 'DELETE' THEN
-    EXECUTE format('UPDATE %I SET upvote_count = upvote_count - 1 WHERE id = $1', OLD.entity_type)
+    -- GREATEST prevents negative counts on duplicate deletes or manual cleanup
+    EXECUTE format('UPDATE %I SET upvote_count = GREATEST(upvote_count - 1, 0) WHERE id = $1', OLD.entity_type)
       USING OLD.entity_id;
   END IF;
   RETURN NULL;
@@ -195,6 +200,17 @@ See `docs/legal-safety-framework.md` for full policy. Key constraints:
 | `suppression_reason` | `legal_demand` · `court_order` · `minor_privacy` · `victim_request` · `family_request` · `editorial` |
 | `moderation_action_type` | `approved` · `rejected` · `edited` · `deleted` · `restored` · `suppressed` · `unsuppressed` · `locked` · `unlocked` |
 | `agency_type` | `local_pd` · `sheriff` · `fbi` · `da` · `state_police` · `other` |
+
+### Agent Model Specs
+
+| Agent | Role | Recommended Model | Notes |
+|-------|------|-------------------|-------|
+| Agent A | Researcher / content seeder | `claude-sonnet` | Broad web research, structured data extraction |
+| Agent B | Legal reviewer | `claude-opus` (minimum) | Defamation defense gate — high accuracy required, especially for `legal_sensitivity: high` cases |
+| Agent C | QA / editorial reviewer | `claude-sonnet` | Framing and completeness check |
+| Agent D | Compliance monitor | `claude-haiku` for SQL/pattern checks, `claude-sonnet` for random sample legal framing audit | Haiku for structured DB queries; upgrade to Sonnet for the 5-case/night framing scan |
+
+---
 
 **Controlled text fields** (stored as `text` or `text[]` with CHECK constraints, not enums):
 
@@ -313,7 +329,7 @@ Case
 | `og_image_url` | text | 1200×630 for Open Graph |
 | `number_of_victims` | int | nullable — for programmatic SEO stats pages |
 | `primary_weapon` | text | nullable — controlled: `firearm` · `knife` · `blunt_object` · `poison` · `strangulation` · `unknown` · `other` |
-| `review_status` | enum | `draft` · `legal_review` · `qa_review` · `approved` · `published` · `rejected` · `suppressed` — pipeline gate, see `docs/data-pipeline.md`. **Valid transitions only:** `draft→legal_review`, `legal_review→qa_review`, `legal_review→draft` (fail), `qa_review→approved`, `qa_review→draft` (body rewrite needed), `approved→published`, `any→rejected` (admin only), `any→suppressed` (takedown). Enforced by app layer + trigger. `rejected` = permanently blocked (admin decision); not the same as Agent B/C FAIL which routes to `draft`. |
+| `review_status` | enum | `draft` · `legal_review` · `qa_review` · `approved` · `published` · `rejected` · `suppressed` — pipeline gate, see `docs/data-pipeline.md`. **Valid transitions only:** `draft→legal_review`, `legal_review→qa_review`, `legal_review→draft` (Agent B FAIL), `qa_review→approved`, `qa_review→legal_review` (Agent C vocab-only fix), `qa_review→draft` (Agent C body-rewrite needed), `approved→published`, `any→rejected` (admin only), `any→suppressed` (takedown). Enforced by app layer + trigger. `rejected` = permanently blocked (admin decision, not Agent B/C FAIL). |
 | `revision_count` | int | NOT NULL DEFAULT 0 — incremented on each Agent B/C FAIL → draft cycle; escalates to human review after 3 |
 | `published_at` | timestamptz | null = draft. Never auto-set for `legal_sensitivity: high`. Must be accompanied by `review_status: published`. |
 | `deleted_at` | timestamptz | Soft delete. Cases are NEVER hard-deleted — destroys audit trail. Set `deleted_at` instead. RLS hides from all public queries. |
@@ -692,9 +708,7 @@ Structured legal proceedings per person per case. `case_people.legal_status` is 
 | Field | Type | Notes |
 |-------|------|-------|
 | `id` | uuid | PK |
-| `case_id` | uuid | FK → cases (ON DELETE CASCADE) |
-| `person_id` | uuid | FK → people (ON DELETE RESTRICT) |
-| `case_person_id` | uuid | FK → case_people.id (ON DELETE CASCADE) — ensures no charge for a person not linked to the case. Composite: `(case_id, person_id)` must match a `case_people` row. |
+| `case_person_id` | uuid | NOT NULL, FK → case_people.id (ON DELETE CASCADE) — single FK; derive `case_id` and `person_id` by joining `case_people`. Eliminates the cross-field consistency problem from having all three columns. |
 | `charge_label` | text | NOT NULL — e.g. `First-degree murder` |
 | `statute_citation` | text | nullable — e.g. `Cal. Penal Code § 187` |
 | `filed_date` | date | nullable |
@@ -715,9 +729,7 @@ Structured legal proceedings per person per case. `case_people.legal_status` is 
 | Field | Type | Notes |
 |-------|------|-------|
 | `id` | uuid | PK |
-| `case_id` | uuid | FK → cases (ON DELETE CASCADE) |
-| `person_id` | uuid | FK → people (ON DELETE RESTRICT) |
-| `case_person_id` | uuid | FK → case_people.id (ON DELETE CASCADE) |
+| `case_person_id` | uuid | NOT NULL, FK → case_people.id (ON DELETE CASCADE) — derive case_id/person_id by joining case_people |
 | `charge_id` | uuid | FK → charges (nullable — ON DELETE SET NULL) |
 | `appeal_type` | enum | `direct_appeal` · `habeas_corpus` · `post_conviction_relief` · `civil` |
 | `filed_date` | date | nullable |
@@ -740,7 +752,7 @@ Citation trail — defamation defense. Every factual claim should have a source 
 | `source_type` | enum | `court_document` · `news_article` · `official_statement` · `book` · `documentary` · `podcast_episode` · `other` |
 | `title` | text | |
 | `publisher` | text | nullable |
-| `url` | text | NOT NULL |
+| `url` | text | NOT NULL, UNIQUE — deduplication key for citation audits |
 | `archived_url` | text | nullable — Wayback Machine fallback |
 | `published_at` | timestamptz | nullable |
 | `created_at` | timestamptz | |
@@ -918,9 +930,9 @@ Kill switch. Suppressed person → renders as "[Name withheld]" site-wide. Suppr
 | Field | Type | Notes |
 |-------|------|-------|
 | `id` | uuid | PK |
-| `entity_type` | text | `people` · `cases` |
-| `entity_id` | uuid | |
-| `reason` | enum | `legal_demand` · `court_order` · `minor_privacy` · `victim_request` · `family_request` · `editorial` |
+| `entity_type` | text | NOT NULL, CHECK (`entity_type IN ('people', 'cases')`) |
+| `entity_id` | uuid | NOT NULL |
+| `reason` | enum | NOT NULL — `legal_demand` · `court_order` · `minor_privacy` · `victim_request` · `family_request` · `editorial` |
 | `takedown_request_id` | uuid | FK → content_takedown_requests (nullable) |
 | `suppressed_by` | uuid | FK → profiles (NOT NULL) |
 | `suppressed_at` | timestamptz | NOT NULL DEFAULT now() |
@@ -938,7 +950,9 @@ Immutable audit log of every moderation decision. Required for legal defense.
 |-------|------|-------|
 | `id` | uuid | PK |
 | `moderator_id` | uuid | FK → profiles (SET NULL) — nullable; null when action is from an automated agent |
-| `agent_source` | text | nullable — `agent_a` · `agent_b` · `agent_c` · `agent_d` · `human`. Set when `moderator_id` is null. At least one must be non-null. |
+| `agent_source` | text | nullable — `agent_a` · `agent_b` · `agent_c` · `agent_d` · `human`. Set when `moderator_id` is null. |
+
+CHECK: `(moderator_id IS NOT NULL OR agent_source IS NOT NULL)` — at least one attribution required. Prevents orphaned audit records.
 | `entity_type` | text | NOT NULL |
 | `entity_id` | uuid | NOT NULL |
 | `action_type` | enum | NOT NULL — `approved` · `rejected` · `edited` · `deleted` · `restored` · `suppressed` · `unsuppressed` · `locked` · `unlocked` |
@@ -1005,6 +1019,7 @@ PK: `(user_id, media_type, media_id)`
 | `tv_shows` | `tmdb_id` | UNIQUE | TMDB deduplication |
 | `tv_shows` | `imdb_id` | UNIQUE | IMDB deduplication |
 | `news_articles` | `url` | UNIQUE | News deduplication |
+| `sources` | `url` | UNIQUE | Citation deduplication |
 | `news_articles` | `published_at` | btree | Recent articles listing |
 | `slug_redirects` | `old_slug` | UNIQUE | Redirect lookups |
 | `jurisdictions` | `state_code` | btree | State SEO pages |
@@ -1028,7 +1043,9 @@ PK: `(user_id, media_type, media_id)`
 | `moderation_actions` | `(entity_type, entity_id)` | btree | Audit trail per entity |
 | `moderation_actions` | `moderator_id` | btree | Actions per moderator |
 | `case_agencies` | `agency_id` | btree | "Cases per agency" reverse lookup |
+| `charges` | `case_person_id` | btree | FK join — primary access path |
 | `charges` | `jurisdiction_id` | btree | FK join |
+| `appeals` | `case_person_id` | btree | FK join — primary access path |
 | `appeals` | `charge_id` | btree | FK join |
 | `community_corrections` | `user_id` | btree | "My corrections" page |
 | `content_reports` | `(entity_type, entity_id)` | btree | Reports on a specific entity |

@@ -24,8 +24,7 @@ New Case Request
       ▼
 ┌─────────────────────────────────────────────────────────┐
 │  STAGE 1: Content Seeding                               │
-│                                                         │
-│  Agent A: Researcher                                    │
+│  Agent A (claude-sonnet): Researcher                    │
 │  → Seeds all tables, writes body + FAQs                 │
 │  → review_status: draft → legal_review                  │
 └──────────────────────────┬──────────────────────────────┘
@@ -33,31 +32,37 @@ New Case Request
                            ▼
 ┌─────────────────────────────────────────────────────────┐
 │  STAGE 2: Legal Review                                  │
-│                                                         │
-│  Agent B: Legal Reviewer                                │
+│  Agent B (claude-opus): Legal Reviewer                  │
 │  → Checks vocab, labels, disclaimers, sources           │
 │  → PASS: review_status → qa_review                      │
-│  → FAIL: review_status → draft + revision notes         │
+│  → FAIL: review_status → draft, revision_count++        │
+│  → revision_count >= 3: escalate to human               │
 └──────────────────────────┬──────────────────────────────┘
                            │
                            ▼
 ┌─────────────────────────────────────────────────────────┐
 │  STAGE 3: QA / Editorial Review                         │
-│                                                         │
-│  Agent C: QA Reviewer                                   │
+│  Agent C (claude-sonnet): QA Reviewer                   │
 │  → Independent framing check, completeness score        │
 │  → PASS: review_status → approved                       │
-│  → FAIL: review_status → legal_review + notes           │
+│  → FAIL (body rewrite): review_status → draft           │
+│  → FAIL (vocab/label only): review_status → legal_review│
 └──────────────────────────┬──────────────────────────────┘
                            │
                            ▼
 ┌─────────────────────────────────────────────────────────┐
-│  STAGE 4: Human Approval Gate                           │
+│  STAGE 4: Publish Gate                                  │
 │                                                         │
-│  Carmen (or trusted editor)                             │
-│  → Required for: legal_sensitivity: high cases          │
-│  → Optional for: standard/elevated (agent-approvable)   │
-│  → Sets review_status: published + published_at         │
+│  legal_sensitivity: HIGH → Carmen required              │
+│    → Carmen reviews, sets published_at + status         │
+│                                                         │
+│  legal_sensitivity: standard/elevated → Auto-publish    │
+│    → System job sets published_at + review_status:      │
+│      published after approved; logs to moderation_      │
+│      actions (agent_source: 'system')                   │
+│                                                         │
+│  DB trigger enforces minimum source coverage before     │
+│  allowing published status to be set                    │
 └──────────────────────────┬──────────────────────────────┘
                            │
                            ▼
@@ -66,11 +71,10 @@ New Case Request
                            ▼
 ┌─────────────────────────────────────────────────────────┐
 │  STAGE 5: Nightly Compliance Audit (ongoing)            │
-│                                                         │
-│  Agent D: Compliance Monitor                            │
-│  → Scans all published cases for drift                  │
-│  → Posts summary to #truecrime (or #casesleuths-ops)    │
-│  → High-severity alerts → DM Carmen                     │
+│  Agent D (haiku + sonnet): Compliance Monitor           │
+│  → P0 violations → auto-suppress + DM Carmen           │
+│  → Stale pipeline stages (> 24h) → alert               │
+│  → Summary → #truecrime                                 │
 └─────────────────────────────────────────────────────────┘
 ```
 
@@ -222,12 +226,25 @@ NEEDS_REVISION (vocab/label issue only — no body rewrite needed) → set `revi
 ## Human Approval Gate
 
 **Required for:** All `legal_sensitivity: high` cases  
-**Optional for:** `standard` and `elevated` cases (Agent C auto-approval sufficient)
+**Not required for:** `standard` and `elevated` cases — auto-published after Agent C approval
 
-Carmen (or trusted editor) reviews Agent C's score report, checks the case page, then:
+### High-sensitivity cases (human required)
+Carmen (or trusted editor) reviews Agent C's score report, checks the case page live, then:
 - Sets `published_at = now()`
 - Sets `review_status: published`
-- Logs to `moderation_actions` (`action_type: approved`, `reason: "human_final_approval"`)
+- Logs to `moderation_actions` (`action_type: approved`, `agent_source: 'human'`, `reason: "human_final_approval"`)
+
+### Standard/elevated cases (auto-publish)
+After Agent C sets `review_status: approved`:
+1. A system job (cron or DB trigger) checks the minimum source coverage gate
+2. If gate passes: sets `published_at = now()`, `review_status: published`
+3. Logs to `moderation_actions` (`action_type: approved`, `agent_source: 'system'`, `reason: "auto_publish_approved"`)
+4. If gate fails: routes back to `legal_review`, increments `revision_count`
+
+**Source coverage gate (enforced at DB level):**
+- At least 1 source in `entity_sources` linked to the case itself
+- At least 1 source linked to each `timeline_event` in the case
+- Trigger blocks `INSERT/UPDATE SET review_status = 'published'` if not met
 
 ---
 
@@ -239,13 +256,25 @@ Carmen (or trusted editor) reviews Agent C's score report, checks the case page,
 
 ### Checks performed on all published cases:
 
-#### Critical (P0) — DM Carmen immediately
-- Any `cases` row with `legal_sensitivity: high` + `published_at IS NOT NULL` but no `moderation_actions` record with `action_type: approved` and `reason LIKE '%human%'` → **published without human review**
-- Any person with `dod IS NOT NULL` + `is_living = true` → **data integrity error**
-- Any `suppressed_entities` record where the suppressed entity's page is still returning 200 (not ISR-revalidated)
+#### Critical (P0) — AUTO-SUPPRESS + DM Carmen immediately
+
+For specific P0 categories, Agent D **auto-suppresses** the case (`review_status: suppressed`, logs to `moderation_actions` with `agent_source: agent_d`, `reason: 'auto_suppressed_p0'`) without waiting for human response. Carmen's DM includes the suppression action already taken and what she needs to review.
+
+**Auto-suppress categories:**
+- Any `cases` row with `legal_sensitivity: high` + `published_at IS NOT NULL` but no `moderation_actions` record confirming human approval → **published without human review** → AUTO-SUPPRESS
+- Any person with `dod IS NOT NULL` + `is_living = true` → **data integrity error** → flag the case, DO NOT auto-suppress (may be a data entry error, not malicious)
+- Any `suppressed_entities` record where the entity's Typesense index still returns the person's name → **suppression bypass** → trigger Typesense re-index immediately
+
+**DM-only categories (no auto-suppress):**
+- Any `case_people` row with `legal_status = 'convicted'` where `appeals.status = 'pending'` (display bug, not legal risk)
+- Any `is_living = true` person with no disclaimer on their case (legal risk but needs editorial judgment)
+
+#### Stale Pipeline Detection (P1) — Include in nightly summary
+- Any case with `review_status IN ('legal_review', 'qa_review')` and `updated_at` older than 24 hours → **Agent B or C may have crashed** → flag for investigation
+- Any case with `review_status = 'approved'` and `published_at IS NULL` for > 7 days → stale approval
 
 #### High (P1) — Include in nightly summary, flag for next editorial pass
-- Any `case_people` row with `legal_status = 'convicted'` where `appeals` table shows `status = 'pending'` → should display "Convicted (appealing)"
+- Any `case_people` row with `legal_status = 'convicted'` where `appeals` table shows `status = 'pending'` → should display "Convicted (appealing)" (DM-only, not auto-suppress)
 - Any person with `is_living = true` + `legal_status NOT IN ('convicted')` + no `disclaimer` text on their case pages
 - Any published case with `content_warnings` empty that contains keywords: `child`, `minor`, `infant`, `sexual`, `rape` in `cases.body`
 - Any `case_people` row added in last 24h with no corresponding `charges` row (for persons with legal_status `alleged`, `convicted`, `acquitted`)
