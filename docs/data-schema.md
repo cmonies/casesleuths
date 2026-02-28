@@ -257,6 +257,16 @@ CREATE POLICY "block_ongoing_trial_upvotes" ON upvotes FOR INSERT TO authenticat
         AND c.status = 'ongoing_trial'
     )
   );
+-- UPDATE policies: also block editing community_notes/corrections on ongoing_trial cases
+-- (INSERT-only lock is insufficient — existing notes could be edited to add content)
+CREATE POLICY "block_ongoing_trial_notes_update" ON community_notes FOR UPDATE TO authenticated
+  USING (
+    NOT EXISTS (SELECT 1 FROM cases WHERE id = community_notes.case_id AND status = 'ongoing_trial')
+  );
+CREATE POLICY "block_ongoing_trial_corrections_update" ON community_corrections FOR UPDATE TO authenticated
+  USING (
+    NOT EXISTS (SELECT 1 FROM cases WHERE id = community_corrections.case_id AND status = 'ongoing_trial')
+  );
 
 Note: The above ongoing_trial lock policies are REQUIRED in the migration — this is an explicit legal safety rule. The remaining full RLS policy set (auth reads for community tables, content_reports) is written in the migration file. The key rule is NO direct anon access to base tables.
 
@@ -317,12 +327,16 @@ SELECT
     WHEN se_person.id IS NOT NULL THEN NULL
     WHEN p.photo_display_policy IN ('blocked', 'requires_review') THEN NULL
     WHEN p.name_display_policy IN ('redacted', 'requires_human_review') THEN NULL
+    -- initials_only = name is intentionally obscured; photo must also be blocked
+    -- (Minor POI rule: initials only → no photo. Consistent with privacy policy table.)
+    WHEN p.name_display_policy = 'initials_only' THEN NULL
     -- Block photo whenever name is being withheld by auto-policy (minor protection)
     WHEN p.name_display_policy = 'auto' AND (
-      p.is_minor_currently = true
-      OR (p.is_minor_at_time_of_crime = true AND cp.charged_as_adult IS NOT TRUE)
+      p.is_minor_currently IS TRUE
+      OR (p.is_minor_at_time_of_crime IS TRUE AND cp.charged_as_adult IS NOT TRUE)
     ) THEN NULL
-    ELSE p.photo_url
+    WHEN p.photo_display_policy = 'allowed' THEN p.photo_url
+    ELSE NULL  -- fail-closed: unknown photo_display_policy values block photo
   END AS display_photo_url,
   cp.legal_status,
   cp.case_role,
@@ -1338,7 +1352,7 @@ Citation trail — defamation defense. Every factual claim should have a source 
 | `source_type` | enum | `court_document` · `news_article` · `official_statement` · `book` · `documentary` · `podcast_episode` · `other` |
 | `title` | text | |
 | `publisher` | text | nullable |
-| `url` | text | NOT NULL, UNIQUE — deduplication key for citation audits |
+| `url` | text | NOT NULL — deduplication key for citation audits. **No plain UNIQUE constraint** — use functional index `CREATE UNIQUE INDEX sources_url_lower_unique ON sources (lower(url))` (case-insensitive). See canonicalization note below. |
 | `archived_url` | text | nullable — Wayback Machine fallback |
 | `published_at` | timestamptz | nullable |
 | `created_at` | timestamptz | |
