@@ -106,7 +106,9 @@ SELECT
     -- 'auto': cannot safely resolve without case context; use public_case_people instead
     -- Note: 'requires_human_review' is already caught by the IN('redacted','requires_human_review') branch above
     ELSE p.name
-  END AS display_name, -- Note: public_people is admin-only; fail-open here is acceptable
+  END AS display_name
+  -- Note: public_people is ADMIN/EDITORIAL only. 'auto' returns '[Review required]' — admin tools
+  -- should show the real name via a service-role query when needed for editorial review.
   CASE
     WHEN se.id IS NOT NULL THEN NULL
     WHEN p.photo_display_policy IN ('blocked', 'requires_review') THEN NULL
@@ -493,6 +495,11 @@ $$ LANGUAGE plpgsql;
 CREATE OR REPLACE FUNCTION null_parent_on_note_soft_delete() RETURNS TRIGGER AS $$
 BEGIN
   IF NEW.deleted_at IS NOT NULL AND OLD.deleted_at IS NULL THEN
+    -- Null out parent_id on all existing replies atomically within the same transaction.
+    -- Race condition mitigation: new replies to a being-deleted parent are prevented by
+    -- the FK constraint (parent row still exists) PLUS application-layer checks on deleted_at.
+    -- App layer must refuse new replies to notes where deleted_at IS NOT NULL before insert.
+    -- This trigger handles existing replies at the moment of soft-delete.
     UPDATE community_notes SET parent_id = NULL WHERE parent_id = NEW.id;
   END IF;
   RETURN NEW;
@@ -501,6 +508,22 @@ $$ LANGUAGE plpgsql;
 -- CREATE TRIGGER null_parent_on_note_soft_delete AFTER UPDATE ON community_notes
 --   FOR EACH ROW WHEN (OLD.deleted_at IS DISTINCT FROM NEW.deleted_at)
 --   EXECUTE FUNCTION null_parent_on_note_soft_delete();
+
+-- slug_redirects INSERT trigger: auto-populate new_slug from cases.slug on INSERT
+-- Eliminates app-layer initialization requirement (was easy to miss)
+CREATE OR REPLACE FUNCTION init_slug_redirect_new_slug() RETURNS TRIGGER AS $$
+BEGIN
+  IF NEW.new_slug IS NULL THEN
+    SELECT slug INTO NEW.new_slug FROM cases WHERE id = NEW.new_case_id;
+    IF NEW.new_slug IS NULL THEN
+      RAISE EXCEPTION 'slug_redirects.new_case_id % not found or has no slug', NEW.new_case_id;
+    END IF;
+  END IF;
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+-- CREATE TRIGGER init_slug_redirect_new_slug BEFORE INSERT ON slug_redirects
+--   FOR EACH ROW EXECUTE FUNCTION init_slug_redirect_new_slug();
 
 -- slug_redirects sync trigger
 -- When cases.slug changes, updates denormalized new_slug on all slug_redirects rows pointing to this case
@@ -651,7 +674,9 @@ ALTER TABLE cases ADD CONSTRAINT cases_primary_weapon_check
 
 -- entity_sources.entity_type (text) — applied on CREATE TABLE entity_sources
 ALTER TABLE entity_sources ADD CONSTRAINT entity_sources_entity_type_check
-  CHECK (entity_type IN ('cases','people','timeline_events','evidence','charges','appeals'));
+  CHECK (entity_type IN ('cases','people','timeline_events','evidence','charges','appeals','community_notes','community_corrections'));
+  -- community_notes and community_corrections added: editors can cite sources for corrections.
+  -- The "any entity" wording in the table description is intentional — expand this CHECK as needed.
 
 -- people.is_living consistency with dod — applied on CREATE TABLE people
 ALTER TABLE people ADD CONSTRAINT people_is_living_dod_check
@@ -840,7 +865,7 @@ Query pattern: `WHERE case_id_a = X OR case_id_b = X`.
 | `id` | uuid | PK |
 | `case_id` | uuid | NOT NULL, FK → cases (ON DELETE CASCADE) |
 | `date` | date | |
-| `date_precision` | enum | NOT NULL DEFAULT `approximate` — `exact` · `approximate` · `year_only`. CHECK: `(date IS NOT NULL OR date_precision = 'approximate')` — when `date` is NULL (unknown), precision must be `approximate`. Semantics: `exact` = date is confirmed as stated; `approximate` = date is estimated/sourced from secondary reporting (UI renders as "circa [date]"); `year_only` = only the year is known (UI renders as "[year]"). A real date with `approximate` precision is valid — it means "approximately this date" not "unknown date". Agent A must always set this explicitly; never leave at default without intention. |
+| `date_precision` | enum | NOT NULL DEFAULT `approximate` — `exact` · `approximate` · `year_only`. CHECK: `(date IS NOT NULL OR date_precision = 'approximate')` — when `date` is NULL (unknown), precision must be `approximate`. Semantics: `exact` = confirmed date; `approximate` = estimated (UI: "circa [date]"); `year_only` = only year is known — store as `YYYY-01-01` (January 1 of the year as a placeholder), UI renders as "[year]" only. A real date with `approximate` precision is valid — means "approximately this date." For `year_only`, set `date = '[year]-01-01'::date` so the NOT NULL constraint is satisfied; the precision field signals to UI not to display month/day. Agent A must always set this explicitly; never leave at default without intention. |
 | `event_type` | enum | `crime_event` · `discovery` · `arrest` · `indictment` · `trial_start` · `verdict` · `sentencing` · `appeal_filed` · `appeal_ruling` · `release` · `death` · `media_coverage` · `other` |
 | `title` | text | |
 | `description` | text | |
