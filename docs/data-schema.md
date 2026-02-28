@@ -346,6 +346,61 @@ CREATE POLICY "block_ongoing_trial_upvotes_delete" ON upvotes FOR DELETE TO auth
     )
   );
 
+-- ⚠️ POLICY OR-TOGETHER WARNING: Postgres RLS policies of the same command/role OR together.
+-- The ongoing_trial INSERT policies above are restrictive (block if trial).
+-- The auth_insert policies below are permissive (allow if owner).
+-- These OR together — which means the INSERT will be allowed if EITHER passes.
+-- SOLUTION: combine the ongoing_trial check INTO the auth_insert WITH CHECK clause.
+-- The standalone block_ongoing_trial_* policies are redundant when the auth policies
+-- include the trial check — but included for clarity. Verify in migration that the
+-- combined WITH CHECK below is the single enforcing policy.
+
+-- REQUIRED: community write policies (who can create/edit content, beyond ongoing_trial gate)
+-- community_notes: ongoing_trial check INCLUDED in WITH CHECK to avoid OR-together bypass
+-- (separate block_ongoing_trial_* policies are belt-and-suspenders, not primary enforcement)
+CREATE POLICY "auth_insert_community_notes" ON community_notes FOR INSERT TO authenticated
+  WITH CHECK (
+    author_id = auth.uid()
+    AND NOT EXISTS (SELECT 1 FROM cases WHERE id = community_notes.case_id AND status = 'ongoing_trial')
+  );
+CREATE POLICY "auth_update_own_community_notes" ON community_notes FOR UPDATE TO authenticated
+  USING (author_id = auth.uid() AND deleted_at IS NULL)
+  WITH CHECK (
+    author_id = auth.uid()
+    AND NOT EXISTS (SELECT 1 FROM cases WHERE id = community_notes.case_id AND status = 'ongoing_trial')
+  );
+CREATE POLICY "auth_delete_own_community_notes" ON community_notes FOR DELETE TO authenticated
+  USING (
+    author_id = auth.uid()
+    AND NOT EXISTS (SELECT 1 FROM cases WHERE id = community_notes.case_id AND status = 'ongoing_trial')
+  );
+-- community_corrections: same pattern with trial check embedded
+CREATE POLICY "auth_insert_community_corrections" ON community_corrections FOR INSERT TO authenticated
+  WITH CHECK (
+    author_id = auth.uid()
+    AND NOT EXISTS (SELECT 1 FROM cases WHERE id = community_corrections.case_id AND status = 'ongoing_trial')
+  );
+CREATE POLICY "auth_update_own_community_corrections" ON community_corrections FOR UPDATE TO authenticated
+  USING (author_id = auth.uid() AND deleted_at IS NULL)
+  WITH CHECK (
+    author_id = auth.uid()
+    AND NOT EXISTS (SELECT 1 FROM cases WHERE id = community_corrections.case_id AND status = 'ongoing_trial')
+  );
+CREATE POLICY "auth_delete_own_community_corrections" ON community_corrections FOR DELETE TO authenticated
+  USING (
+    author_id = auth.uid()
+    AND NOT EXISTS (SELECT 1 FROM cases WHERE id = community_corrections.case_id AND status = 'ongoing_trial')
+  );
+-- Anon read: published community content is public
+CREATE POLICY "anon_read_community_notes" ON community_notes FOR SELECT TO anon, authenticated
+  USING (deleted_at IS NULL);
+CREATE POLICY "anon_read_community_corrections" ON community_corrections FOR SELECT TO anon, authenticated
+  USING (deleted_at IS NULL);
+
+-- REQUIRED: revoke UPDATE on upvotes (defense-in-depth alongside block_upvote_update trigger)
+-- service_role retains UPDATE for admin fixes (Supabase service_role bypasses REVOKE via superuser)
+REVOKE UPDATE ON upvotes FROM authenticated, anon;
+
 Note: The above ongoing_trial lock policies are REQUIRED in the migration — this is an explicit legal safety rule. The remaining full RLS policy set (auth reads for community tables, content_reports) is written in the migration file. The key rule is NO direct anon access to base tables.
 
 **`public_people` is ADMIN/EDITORIAL USE ONLY — not for public pages.** It returns `'[Review required]'` for `auto` policy persons, which would create confusing UX if used on public-facing routes. Public search, Typesense indexing, and all user-visible pages MUST use `public_case_people` (case-scoped view below). `public_people` is safe for admin dashboards and editorial review tools only.
@@ -1527,8 +1582,8 @@ PK: `(case_id, book_id)`
 
 | Field | Type | Notes |
 |-------|------|-------|
-| `user_id` | uuid | FK → profiles (ON DELETE CASCADE) |
-| `entity_type` | text | Table name — must match an actual table for trigger dispatch |
+| `user_id` | uuid | NOT NULL, FK → profiles (ON DELETE CASCADE) — NOT NULL enforces user ownership |
+| `entity_type` | text | NOT NULL — Table name; must match an actual table for trigger dispatch |
 | `entity_id` | uuid | No Postgres FK (polymorphic) — **no automatic orphan cleanup trigger.** Nightly reconciliation cron recomputes `upvote_count` from live rows only; orphaned upvote rows (parent soft-deleted) do not affect count accuracy since the reconciliation query JOINs to the parent table. Agent D flags orphan count mismatches. App layer should block new upvotes on soft-deleted entities (check `deleted_at` before insert). |
 | `created_at` | timestamptz | |
 
