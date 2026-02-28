@@ -108,12 +108,19 @@ SELECT
     -- 'auto': cannot safely resolve without case context; use public_case_people instead
     -- Note: 'requires_human_review' is already caught by the IN('redacted','requires_human_review') branch above
     ELSE p.name
-  END AS display_name
+  END AS display_name, -- comma required: SQL SELECT list
   -- Note: public_people is ADMIN/EDITORIAL only. 'auto' returns '[Review required]' — admin tools
   -- should show the real name via a service-role query when needed for editorial review.
   CASE
     WHEN se.id IS NOT NULL THEN NULL
     WHEN p.photo_display_policy IN ('blocked', 'requires_review') THEN NULL
+    -- INTENTIONAL DIVERGENCE from public_case_people:
+    -- public_people is admin-only. For 'auto', we can't resolve without case context here,
+    -- so we fail-closed: block photo until admin resolves the policy.
+    -- public_case_people resolves 'auto' with case context and only blocks photo if
+    -- name would actually be withheld (minor/charged-as-adult check). This is correct.
+    -- An adult with 'auto' policy: photo visible in public (correct name shown),
+    -- photo blocked in admin view (unresolved — admin must confirm policy). Intentional.
     WHEN p.name_display_policy IN ('auto', 'requires_human_review') THEN NULL
     ELSE p.photo_url
   END AS display_photo_url,
@@ -318,7 +325,9 @@ BEGIN
   IF TG_OP = 'INSERT' THEN
     IF NEW.entity_type = 'community_notes' THEN
       UPDATE community_notes SET upvote_count = upvote_count + 1 WHERE id = NEW.entity_id;
-    -- ELSIF NEW.entity_type = 'other_table' THEN ... (extend when CHECK is extended)
+    -- community_corrections is NOT in MVP upvote scope — no upvote_count column on that table yet.
+    -- To extend: (1) add upvote_count to community_corrections, (2) add to entity_type CHECK,
+    -- (3) add ELSIF branch here for both INSERT and DELETE cases.
     END IF;
   ELSIF TG_OP = 'DELETE' THEN
     IF OLD.entity_type = 'community_notes' THEN
