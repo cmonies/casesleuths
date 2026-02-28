@@ -230,10 +230,29 @@ CREATE POLICY "auth_read_own_reports" ON content_reports FOR SELECT TO authentic
 -- Use service_role for: all agent writes, admin dashboard, SSR data fetching
 
 -- Upvote write: authenticated users only, one per entity
+-- ongoing_trial check EMBEDDED here (not separate policy) to prevent OR-together bypass
 CREATE POLICY "auth_insert_upvote" ON upvotes FOR INSERT TO authenticated
-  WITH CHECK (user_id = auth.uid());
+  WITH CHECK (
+    user_id = auth.uid()
+    AND NOT EXISTS (
+      SELECT 1 FROM community_notes cn
+      JOIN cases c ON c.id = cn.case_id
+      WHERE cn.id = upvotes.entity_id
+        AND upvotes.entity_type = 'community_notes'
+        AND c.status = 'ongoing_trial'
+    )
+  );
 CREATE POLICY "auth_delete_own_upvote" ON upvotes FOR DELETE TO authenticated
-  USING (user_id = auth.uid());
+  USING (
+    user_id = auth.uid()
+    AND NOT EXISTS (
+      SELECT 1 FROM community_notes cn
+      JOIN cases c ON c.id = cn.case_id
+      WHERE cn.id = upvotes.entity_id
+        AND upvotes.entity_type = 'community_notes'
+        AND c.status = 'ongoing_trial'
+    )
+  );
 ```
 -- REQUIRED GRANTS: must be executed AFTER all views are created (migration order matters)
 -- public_cases, public_case_people, public_case_tombstones are defined in the
