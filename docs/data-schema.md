@@ -249,19 +249,19 @@ GRANT SELECT ON public_people TO authenticated;  -- editorial/admin tools only
 -- Without these, authenticated (non-service-role) admin users are hard-blocked.
 -- Note: service_role always bypasses RLS (for agents + server-side code).
 CREATE POLICY "admin_read_suppressed_entities" ON suppressed_entities FOR SELECT TO authenticated
-  USING (auth.jwt() ->> 'role' IN ('admin', 'editorial'));
+  USING (auth.jwt() -> 'app_metadata' ->> 'role' IN ('admin', 'editorial'));
 -- Split per-command: FOR ALL with USING only ignores USING on INSERT, allowing non-admin inserts
 CREATE POLICY "admin_insert_suppressed_entities" ON suppressed_entities FOR INSERT TO authenticated
-  WITH CHECK (auth.jwt() ->> 'role' IN ('admin', 'editorial'));
+  WITH CHECK (auth.jwt() -> 'app_metadata' ->> 'role' IN ('admin', 'editorial'));
 CREATE POLICY "admin_update_suppressed_entities" ON suppressed_entities FOR UPDATE TO authenticated
-  USING (auth.jwt() ->> 'role' IN ('admin', 'editorial'))
-  WITH CHECK (auth.jwt() ->> 'role' IN ('admin', 'editorial'));
+  USING (auth.jwt() -> 'app_metadata' ->> 'role' IN ('admin', 'editorial'))
+  WITH CHECK (auth.jwt() -> 'app_metadata' ->> 'role' IN ('admin', 'editorial'));
 CREATE POLICY "admin_delete_suppressed_entities" ON suppressed_entities FOR DELETE TO authenticated
-  USING (auth.jwt() ->> 'role' IN ('admin', 'editorial'));
+  USING (auth.jwt() -> 'app_metadata' ->> 'role' IN ('admin', 'editorial'));
 CREATE POLICY "admin_read_moderation_actions" ON moderation_actions FOR SELECT TO authenticated
-  USING (auth.jwt() ->> 'role' IN ('admin', 'editorial'));
+  USING (auth.jwt() -> 'app_metadata' ->> 'role' IN ('admin', 'editorial'));
 CREATE POLICY "admin_write_moderation_actions" ON moderation_actions FOR INSERT TO authenticated
-  WITH CHECK (auth.jwt() ->> 'role' IN ('admin', 'editorial'));
+  WITH CHECK (auth.jwt() -> 'app_metadata' ->> 'role' IN ('admin', 'editorial'));
 -- moderation_actions is an immutable audit log: no UPDATE or DELETE policies.
 -- RLS default-deny covers UPDATE/DELETE — intentional. If someone adds a permissive
 -- policy later, this comment serves as the guard. Do not add UPDATE/DELETE policies.
@@ -277,8 +277,9 @@ END;
 $$ LANGUAGE plpgsql;
 -- CREATE TRIGGER block_upvote_update BEFORE UPDATE ON upvotes
 --   FOR EACH ROW EXECUTE FUNCTION block_upvote_update();
--- ⚠️ REQUIRED — must be uncommented in migration. Without this, UPDATE on upvotes
--- silently drifts upvote_count without triggering update_upvote_count.
+-- ⚠️ REQUIRED — must be uncommented in migration.
+-- Defense-in-depth: also REVOKE UPDATE ON upvotes FROM authenticated, anon;
+-- (service_role can still UPDATE for admin fixes; authenticated users cannot)
 
 -- REQUIRED: ongoing_trial community lock — these policies MUST be in the migration
 -- community_notes INSERT: block on ongoing_trial cases
@@ -313,9 +314,16 @@ CREATE POLICY "block_ongoing_trial_upvotes" ON upvotes FOR INSERT TO authenticat
 CREATE POLICY "block_ongoing_trial_notes_update" ON community_notes FOR UPDATE TO authenticated
   USING (
     NOT EXISTS (SELECT 1 FROM cases WHERE id = community_notes.case_id AND status = 'ongoing_trial')
+  )
+  WITH CHECK (
+    -- Also blocks updates that would move a note INTO an ongoing_trial case (case_id change)
+    NOT EXISTS (SELECT 1 FROM cases WHERE id = community_notes.case_id AND status = 'ongoing_trial')
   );
 CREATE POLICY "block_ongoing_trial_corrections_update" ON community_corrections FOR UPDATE TO authenticated
   USING (
+    NOT EXISTS (SELECT 1 FROM cases WHERE id = community_corrections.case_id AND status = 'ongoing_trial')
+  )
+  WITH CHECK (
     NOT EXISTS (SELECT 1 FROM cases WHERE id = community_corrections.case_id AND status = 'ongoing_trial')
   );
 -- DELETE policies: also block deletion (removing content during active trial = mutation)
