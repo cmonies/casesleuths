@@ -235,8 +235,9 @@ CREATE POLICY "auth_insert_upvote" ON upvotes FOR INSERT TO authenticated
 CREATE POLICY "auth_delete_own_upvote" ON upvotes FOR DELETE TO authenticated
   USING (user_id = auth.uid());
 ```
--- REQUIRED GRANTS: anon must be able to SELECT from public views (views don't inherit
--- base table grants; explicit GRANT is required in Supabase for anon reads to work)
+-- REQUIRED GRANTS: must be executed AFTER all views are created (migration order matters)
+-- public_cases, public_case_people, public_case_tombstones are defined in the
+-- Suppression-safe views section above — GRANTs must come after that section in migration.
 GRANT SELECT ON public_cases TO anon, authenticated;
 GRANT SELECT ON public_case_people TO anon, authenticated;
 GRANT SELECT ON public_case_tombstones TO anon, authenticated;
@@ -294,8 +295,9 @@ CREATE POLICY "block_ongoing_trial_corrections" ON community_corrections FOR INS
       SELECT 1 FROM cases WHERE id = community_corrections.case_id AND status = 'ongoing_trial'
     )
   );
--- upvotes INSERT: block on ongoing_trial cases (entity_type='community_notes' only in MVP;
--- join through community_notes.case_id to reach cases.status)
+-- upvotes INSERT: block on ongoing_trial cases. MVP only supports entity_type='community_notes'
+-- (enforced by CHECK constraint on upvotes table). If entity_type CHECK is ever extended,
+-- add additional ELSIF branches in update_upvote_count AND matching ongoing_trial policies here.
 CREATE POLICY "block_ongoing_trial_upvotes" ON upvotes FOR INSERT TO authenticated
   WITH CHECK (
     NOT EXISTS (
