@@ -1,5 +1,7 @@
 # CaseSleuths — Data Schema
 
+_v0.20 · 2026-02-27 — P0 fixes: replaced dynamic SQL in upvote trigger with static IF/ELSIF dispatch (eliminates SQL injection vector), added trigger ordering prefix (aaa_enforce_review_status_transition fires first). P1 fixes: elevated sensitivity advisory flag in publish gate, country_code + moderation_actions covering indexes added, case_podcast_episodes added to webhook list, people name/photo policy explicit NOT NULL DEFAULT, case_reddit_posts upsert conflict target documented, suppressed_entities scope + redundancy notes, entity_sources CHECK rationale note, case_people legal_status+role combo documentation. P2 fixes: case_agencies.role convention note, interview_people.role CHECK constraint, sources URL normalization note, media_progress_status enum parenthetical moved to note._
+
 _v0.16 · 2026-02-28 — P0 fixes: added qa_review→legal_review transition, fixed upvote trigger GREATEST clamp. P1 fixes: dropped redundant case_id/person_id from charges/appeals (join through case_people only), moderation_actions at-least-one-non-null CHECK, Agent D stale pipeline + auto-suppress P0 policy, charges/appeals case_person_id indexes, sources.url UNIQUE, minimum source coverage publish gate, pipeline publish flow for standard/elevated cases. P2 fixes: charges_dropped in legal framework, suppressed_entities.entity_type CHECK, agent model specs, Typesense suppression note, pipeline diagram updated_
 
 ---
@@ -43,7 +45,7 @@ _v0.16 · 2026-02-28 — P0 fixes: added qa_review→legal_review transition, fi
 - Tag / listing pages: `revalidate: 1800` (30 min)
 - Person / agency pages: `revalidate: 3600` (1 hour)
 
-**Revalidation implementation:** Supabase DB webhooks → Next.js `/api/revalidate?secret=TOKEN&path=/cases/[slug]`. Webhooks required on: `cases`, `timeline_events`, `case_people`, `evidence`, `interviews`, `case_faqs`, `podcast_episodes`, `tv_shows`, `news_articles`, `case_subreddits`, `case_tags`, `related_cases`, `charges`, `appeals`, `case_agencies`, `books`, `case_books`, `jurisdictions`, `case_series`, `case_series_members`, `suppressed_entities` (suppressing a person or case must trigger immediate ISR revalidation — content must not remain visible after suppression).
+**Revalidation implementation:** Supabase DB webhooks → Next.js `/api/revalidate?secret=TOKEN&path=/cases/[slug]`. Webhooks required on: `cases`, `timeline_events`, `case_people`, `evidence`, `interviews`, `case_faqs`, `podcast_episodes`, `case_podcast_episodes`, `tv_shows`, `news_articles`, `case_subreddits`, `case_tags`, `related_cases`, `charges`, `appeals`, `case_agencies`, `books`, `case_books`, `jurisdictions`, `case_series`, `case_series_members`, `suppressed_entities` (suppressing a person or case must trigger immediate ISR revalidation — content must not remain visible after suppression). Note: `case_podcast_episodes` (the join table) must be included — it changes whenever an episode is linked to a case, which is the ISR-triggering event. `podcast_episodes` itself rarely changes after initial RSS ingestion.
 
 ---
 
@@ -309,16 +311,20 @@ $$ LANGUAGE plpgsql;
 --   case_reddit_posts → uses fetched_at instead (scores updated in-place on each sync)
 --   All pure join tables (case_tags, case_agencies, case_books, etc.) → no timestamps
 
--- Upvote count trigger (dispatches dynamically on entity_type)
+-- Upvote count trigger (static dispatch — no dynamic SQL, no injection risk)
+-- Future: add ELSIF branches here when upvotes.entity_type CHECK is extended to new tables.
 CREATE OR REPLACE FUNCTION update_upvote_count() RETURNS TRIGGER AS $$
 BEGIN
   IF TG_OP = 'INSERT' THEN
-    EXECUTE format('UPDATE %I SET upvote_count = upvote_count + 1 WHERE id = $1', NEW.entity_type)
-      USING NEW.entity_id;
+    IF NEW.entity_type = 'community_notes' THEN
+      UPDATE community_notes SET upvote_count = upvote_count + 1 WHERE id = NEW.entity_id;
+    -- ELSIF NEW.entity_type = 'other_table' THEN ... (extend when CHECK is extended)
+    END IF;
   ELSIF TG_OP = 'DELETE' THEN
-    -- GREATEST prevents negative counts on duplicate deletes or manual cleanup
-    EXECUTE format('UPDATE %I SET upvote_count = GREATEST(upvote_count - 1, 0) WHERE id = $1', OLD.entity_type)
-      USING OLD.entity_id;
+    IF OLD.entity_type = 'community_notes' THEN
+      -- GREATEST prevents negative counts on duplicate deletes or manual cleanup
+      UPDATE community_notes SET upvote_count = GREATEST(upvote_count - 1, 0) WHERE id = OLD.entity_id;
+    END IF;
   END IF;
   RETURN NULL;
 END;
@@ -332,7 +338,6 @@ $$ LANGUAGE plpgsql;
 -- reconciliation cron verifies counts; upvotes for hard-deleted entities are cleaned
 -- up via app-layer DELETE before hard delete (hard deletes are rare).
 
--- Note: entity_type values MUST match actual table names for dynamic dispatch.
 -- Soft-delete guard: RLS on upvotes prevents new inserts when parent deleted_at IS NOT NULL.
 -- Service-role bypass: if a service-role client inserts an upvote for a soft-deleted entity,
 -- the trigger will still fire. Accept this edge case at MVP; mitigate at scale by adding
@@ -342,7 +347,10 @@ $$ LANGUAGE plpgsql;
 ```
 
 ```sql
--- legal_sensitivity: high publish block trigger
+-- legal_sensitivity publish gate trigger
+-- Distinction: 'high' = HARD BLOCK (no auto-publish without human approval).
+--              'elevated' = ADVISORY FLAG (auto-publish allowed, but human should review).
+--              'standard' = no gate.
 -- MIGRATION DEPENDENCY: this function must be created AFTER the moderation_actions table exists.
 -- Migration order: CREATE TABLE moderation_actions → CREATE FUNCTION block_high_sensitivity_autopublish
 -- (plpgsql resolves table names at runtime, not compile time, but the SELECT inside will error
@@ -350,22 +358,36 @@ $$ LANGUAGE plpgsql;
 CREATE OR REPLACE FUNCTION block_high_sensitivity_autopublish() RETURNS TRIGGER AS $$
 BEGIN
   IF NEW.review_status = 'published'
-     AND OLD.review_status != 'published'
-     AND NEW.legal_sensitivity = 'high' THEN
-    -- Check for a human-authored 'approved' moderation action.
-    -- IMPORTANT: the state machine trigger logs action_type='edited' for all transitions.
-    -- App layer MUST create a separate moderation_actions row with action_type='approved',
-    -- agent_source='human' before setting review_status='published' on high-sensitivity cases.
-    -- This is a two-step process: (1) human creates approved record, (2) system sets published.
-    IF NOT EXISTS (
-      SELECT 1 FROM moderation_actions
-      WHERE entity_type = 'cases'
-        AND entity_id = NEW.id
-        AND action_type = 'approved'
-        AND agent_source = 'human'
-    ) THEN
-      RAISE EXCEPTION 'Cannot auto-publish case % with legal_sensitivity=high: human approval required', NEW.id;
+     AND OLD.review_status != 'published' THEN
+
+    IF NEW.legal_sensitivity = 'high' THEN
+      -- HARD BLOCK: high-sensitivity cases require a human-authored 'approved' record.
+      -- IMPORTANT: the state machine trigger logs action_type='edited' for all transitions.
+      -- App layer MUST create a separate moderation_actions row with action_type='approved',
+      -- agent_source='human' before setting review_status='published' on high-sensitivity cases.
+      -- This is a two-step process: (1) human creates approved record, (2) system sets published.
+      IF NOT EXISTS (
+        SELECT 1 FROM moderation_actions
+        WHERE entity_type = 'cases'
+          AND entity_id = NEW.id
+          AND action_type = 'approved'
+          AND agent_source = 'human'
+      ) THEN
+        RAISE EXCEPTION 'Cannot auto-publish case % with legal_sensitivity=high: human approval required', NEW.id;
+      END IF;
+
+    ELSIF NEW.legal_sensitivity = 'elevated' THEN
+      -- ADVISORY FLAG: elevated cases may auto-publish, but Agent B must flag for human review.
+      -- Log a WARNING to moderation_actions and allow publish to proceed.
+      -- 'elevated' = advisory, not a hard stop. Human should review but system will not block.
+      INSERT INTO moderation_actions (entity_type, entity_id, action_type, agent_source, metadata)
+      VALUES ('cases', NEW.id, 'flagged', 'system',
+        jsonb_build_object(
+          'reason', 'elevated_sensitivity_autopublish',
+          'message', 'Case published with legal_sensitivity=elevated. Human review recommended.'
+        ));
     END IF;
+
   END IF;
   RETURN NEW;
 END;
@@ -461,7 +483,16 @@ BEGIN
   RETURN NEW;
 END;
 $$ LANGUAGE plpgsql;
--- CREATE TRIGGER enforce_review_status_transition BEFORE UPDATE ON cases
+-- TRIGGER ORDERING NOTE: Postgres fires BEFORE UPDATE triggers alphabetically by trigger name.
+-- The four BEFORE UPDATE triggers on `cases` must fire in this order:
+--   1. enforce_review_status_transition (validate transition FIRST — cheapest gate)
+--   2. block_high_sensitivity_autopublish (check moderation_actions)
+--   3. check_living_person_disclaimer (scan case_people)
+--   4. check_source_coverage (scan entity_sources + timeline_events)
+-- To force enforce_review_status_transition to fire first despite alphabetical ordering,
+-- the trigger is named with an 'aaa_' prefix. Trigger names intentionally prefixed to
+-- control execution order — do not rename without considering trigger firing sequence.
+-- CREATE TRIGGER aaa_enforce_review_status_transition BEFORE UPDATE ON cases
 --   FOR EACH ROW WHEN (OLD.review_status IS DISTINCT FROM NEW.review_status)
 --   EXECUTE FUNCTION enforce_review_status_transition();
 
@@ -552,8 +583,6 @@ $$ LANGUAGE plpgsql;
 --   FOR EACH ROW EXECUTE FUNCTION sync_case_year();
 ```
 
-**Security note:** The dynamic SQL in the trigger uses `entity_type` as a table name. The `CHECK` constraint on `entity_type` is the sole injection guard — never remove it or allow unvalidated values in this column. For maximum safety at scale, replace with per-entity triggers (one dedicated trigger per upvotable table).
-
 **Hot-row contention note:** At high traffic, constant `upvote_count` increments on a single row can become a write bottleneck. Mitigation at scale: sharded counter tables or batched aggregation. For MVP (top 20 cases), trigger approach is fine.
 
 **Client implementation note:** Supabase Realtime channels must be explicitly unsubscribed when the user navigates away from a case page. Failing to do so causes memory leaks as channels accumulate. Scope each subscription to the page lifecycle (mount → subscribe, unmount → unsubscribe).
@@ -562,7 +591,7 @@ $$ LANGUAGE plpgsql;
 
 ### FK Cascade Policy
 
-**Default: `ON DELETE CASCADE` for all child rows** (timeline_events, case_people, evidence, etc. cascade when their parent case row is deleted). Pure join tables always cascade. **Exception:** `people` and `agencies` use `ON DELETE RESTRICT`. **Note on `cases` hard-delete:** the `block_case_hard_delete` trigger prevents any DELETE on the `cases` table — child cascades therefore can never fire in practice. They exist for DB integrity consistency (if the trigger were ever removed) but the operational path to removing cases is always soft-delete via `deleted_at`. |
+**Default: `ON DELETE CASCADE` for all child rows** (timeline_events, case_people, evidence, etc. cascade when their parent case row is deleted). Pure join tables always cascade. **Exception:** `people` and `agencies` use `ON DELETE RESTRICT`. **Note on `cases` hard-delete:** the `block_case_hard_delete` trigger prevents any DELETE on the `cases` table — child cascades therefore can never fire in practice. They exist in the schema for DB integrity consistency. If the `block_case_hard_delete` trigger is ever removed, cascades will activate and all child rows (timeline_events, case_people, charges, appeals, evidence, etc.) will be deleted. The operational path to removing cases is always soft-delete via `deleted_at` — never a hard DELETE. |
 
 ---
 
@@ -630,7 +659,7 @@ See `docs/legal-safety-framework.md` for full policy. Key constraints:
 | `news_source` | `manual` · `rss` · `google_news` |
 | `relevance` | `primary` · `mentions` |
 | `media_type` | `podcast_episode` · `tv_show` |
-| `media_progress_status` | `completed` · `in_progress` · `want_to_consume` — **canonical values** (overrides any table definition using `watched`/`listening`/`want_to_watch`) |
+| `media_progress_status` | `completed` · `in_progress` · `want_to_consume` — **canonical values**. Note (v0.20): earlier drafts used `watched`/`listening`/`want_to_watch` — these are superseded. Any migration from old values must map to these three. |
 | `correction_status` | `pending` · `accepted` · `rejected` |
 | `report_reason` | `inaccurate` · `inappropriate` · `spam` · `copyright` · `other` |
 | `report_status` | `pending` · `reviewed` · `resolved` |
@@ -894,8 +923,8 @@ Query pattern: `WHERE case_id_a = X OR case_id_b = X`.
 | `is_living` | bool | nullable — null = unknown. `true` + not convicted → aggressive disclaimer required. CHECK: `(dod IS NULL OR is_living = false)` — person cannot have a date of death and be marked living. |
 | `is_minor_at_time_of_crime` | bool | nullable — under 18 when the crime occurred |
 | `is_minor_currently` | bool | nullable — still a minor today. **Auto-update mechanism:** Agent D nightly cron detects when `is_minor_currently = true` persons turn 18. On detection, Agent D does NOT auto-flip the flag. Instead: (1) Agent D sets `name_display_policy = 'requires_human_review'` (sentinel value — prevents display), (2) logs a `moderation_actions` record (`action_type: 'flagged'`, `agent_source: 'agent_d'`, `metadata: { "reason": "minor_aged_out", "dob": "...", "age": 18 }`), (3) alerts Carmen directly. Carmen reviews the case and either sets `name_display_policy = 'full'` (clear for display) or `name_display_policy = 'redacted'` (keep protected). Only after Carmen acts does `is_minor_currently` get set to false. **No auto-flip without human review.** Add `'requires_human_review'` to `name_display_policy` enum. The `public_case_people` view treats `requires_human_review` as `'[Review required]'` (same as auto sentinel). |
-| `name_display_policy` | enum | `full` · `initials_only` · `redacted` · `auto` · `requires_human_review` — default `auto`. `auto` = system resolves based on minor flags + case role. `requires_human_review` = sentinel set by Agent D when a minor ages out — blocks display until human clears it. |
-| `photo_display_policy` | enum | `allowed` · `blocked` · `requires_review` — default `requires_review` |
+| `name_display_policy` | enum | `NOT NULL DEFAULT 'auto'` — `full` · `initials_only` · `redacted` · `auto` · `requires_human_review`. `auto` = system resolves based on minor flags + case role. `requires_human_review` = sentinel set by Agent D when a minor ages out — blocks display until human clears it. |
+| `photo_display_policy` | enum | `NOT NULL DEFAULT 'requires_review'` — `allowed` · `blocked` · `requires_review`. New persons default to requiring review before photos are shown. |
 | `links` | jsonb | `{ "wikipedia": "...", "news": [...] }` |
 | `created_at` | timestamptz | |
 | `updated_at` | timestamptz | |
@@ -920,6 +949,14 @@ Surrogate PK provides a stable FK target for `charges` and `appeals` (they refer
 UNIQUE: `(case_id, person_id)` — **one row per person per case**. `legal_status` is updated in place as the investigation evolves (e.g. `witness` → `alleged`). Status change history is tracked in `moderation_actions` (before/after in `metadata`). The surrogate PK `id` is kept for stable FK references from `charges` and `appeals`.
 
 **When to update vs insert:** Always update the existing row. Never insert a second row for the same person-case pair. If a person's role in a case changes, update `legal_status` and log the change in `moderation_actions`.
+
+**NOTE — legal_status + case_role valid/invalid combinations:**
+The CHECK constraint blocks `legal_status` for `detective`/`attorney`/`judge` only. Additional combos require Agent B validation on every pipeline pass:
+- `victim` + `legal_status`: ALLOWED only for self-defense cases where the victim was also charged (e.g. `victim` + `alleged`). Agent B must verify this combo is supported by the case facts.
+- `witness` + `legal_status`: ALLOWED — witnesses can be formally charged.
+- `victim` + `person_of_interest`: technically not blocked by CHECK but is semantically nonsensical; Agent B must flag.
+- Any `legal_status` value inconsistent with `charges.disposition` for the same `case_person_id`: Agent B must flag. The DB does not auto-sync these.
+Agent B must verify `legal_status` is consistent with `case_role` and `charges.disposition` on every pipeline pass.
 
 **FK cascade policies:**
 - `case_people.case_id` → ON DELETE CASCADE
@@ -946,7 +983,7 @@ UNIQUE: `(case_id, person_id)` — **one row per person per case**. `legal_statu
 |-------|------|-------|
 | `case_id` | uuid | NOT NULL, FK → cases (ON DELETE CASCADE) |
 | `agency_id` | uuid | FK → agencies (RESTRICT) |
-| `role` | text | e.g. `lead investigator` · `supporting` |
+| `role` | text | e.g. `lead_investigator` · `supporting` · `forensics`. **Intentionally free-form** (agency roles are more varied than can be captured in an enum). Convention: lowercase snake_case. No CHECK constraint — document new values in `docs/taxonomy.md` when introduced. |
 
 PK: `(case_id, agency_id)`
 
@@ -996,7 +1033,7 @@ Supports group interviews.
 |-------|------|-------|
 | `interview_id` | uuid | FK → interviews (ON DELETE CASCADE) |
 | `person_id` | uuid | FK → people (RESTRICT) |
-| `role` | text | `interviewee` · `interviewer` |
+| `role` | text | CHECK (`role IN ('interviewee', 'interviewer')`). Only two valid values — a CHECK is appropriate here. |
 
 PK: `(interview_id, person_id)`
 
@@ -1142,6 +1179,8 @@ Retention: keep top 50 posts per case by score. Upsert on `post_id` UNIQUE on ea
 | `fetched_at` | timestamptz | Updated on each sync |
 | `created_at` | timestamptz | |
 
+**Upsert pattern:** `INSERT INTO case_reddit_posts (...) ON CONFLICT (post_id) DO UPDATE SET score = EXCLUDED.score, comment_count = EXCLUDED.comment_count, fetched_at = now()`. The conflict target is `post_id` UNIQUE, not the uuid PK. Do not attempt to upsert on `id` — the uuid PK is not the deduplication key.
+
 **Reddit API note:** Register Reddit OAuth app from day one (100 req/min free). Do not rely on unauthenticated `.json` endpoints for production — rate-limited to ~10 req/min and have been breaking since Reddit's 2023 API changes.
 
 ---
@@ -1237,6 +1276,8 @@ Citation trail — defamation defense. Every factual claim should have a source 
 | `created_at` | timestamptz | |
 | `updated_at` | timestamptz | |
 
+**URL canonicalization required before INSERT:** strip UTM params, normalize trailing slash, lowercase scheme+host. Use a helper function in the app layer — do NOT rely on the DB to normalize. `sources.url UNIQUE` deduplication is case-sensitive in Postgres; inconsistent normalization (e.g. `http://` vs `https://`, trailing slash vs none) will cause duplicate rows to bypass the UNIQUE constraint. Canonical form: `https://host.com/path` (no trailing slash, no query params except content-relevant ones).
+
 ### `entity_sources` (pure join — no timestamps)
 
 Links sources to any entity (case, person, timeline event, evidence, etc.) with claim type tagging.
@@ -1250,6 +1291,8 @@ Links sources to any entity (case, person, timeline event, evidence, etc.) with 
 | `notes` | text | nullable |
 
 PK: `(source_id, entity_type, entity_id)`
+
+**Why entity_sources CHECK includes exactly these entity types:** These are the primary citation-bearing entities — the things that make factual claims requiring sourcing. `community_notes`, `community_corrections`, and `content_reports` are user-generated and cite existing sources; they don't themselves GET cited. `moderation_actions` are internal audit records, not citable claims. This CHECK is intentionally narrower than `content_reports.entity_type` or `moderation_actions.entity_type`. Do not extend without evaluating whether the new entity type is genuinely citation-bearing.
 
 **Orphan cleanup policy (all polymorphic tables):** The following tables have no Postgres FK because they reference multiple parent tables: `entity_sources`, `upvotes`, `content_reports`, `content_takedown_requests`, `suppressed_entities`. Orphan cleanup applies to all of them:
 - **entity_sources:** Agent D nightly scan flags rows where `entity_id` no longer exists in the target table. Hard deletes from parent tables: app layer must DELETE from entity_sources before (or in the same transaction as) any hard delete of a referenced entity.
@@ -1419,13 +1462,17 @@ Kill switch. Suppressed person → renders as "[Name withheld]" site-wide. Suppr
 | `entity_type` | text | NOT NULL, CHECK (`entity_type IN ('people', 'cases')`) |
 | `entity_id` | uuid | NOT NULL |
 | `reason` | enum | NOT NULL — `legal_demand` · `court_order` · `minor_privacy` · `victim_request` · `family_request` · `editorial` |
+
+**Scope note — intentional narrowing:** Suppression is case-level or person-level only. The CHECK (`entity_type IN ('people', 'cases')`) is intentionally narrow. For sub-entity takedowns (timeline events, evidence, community_notes, community_corrections), use soft-delete via `moderation_actions` + app-layer removal rather than `suppressed_entities`. Do not extend this CHECK to sub-entity types without evaluating the implications for `public_case_tombstones` (which currently only renders suppressed cases, not suppressed sub-entities).
 | `takedown_request_id` | uuid | FK → content_takedown_requests (nullable) |
 | `suppressed_by` | uuid | FK → profiles (SET NULL) — nullable; null when suppression is agent-initiated (e.g. Agent D auto-suppress) |
 | `agent_source` | text | nullable — CHECK (`agent_source IN ('agent_a','agent_b','agent_c','agent_d','human','system')`). Also subject to: CHECK `(suppressed_by IS NOT NULL OR agent_source IS NOT NULL)` — same at-least-one-non-null pattern as `moderation_actions`. |
 | `suppressed_at` | timestamptz | NOT NULL DEFAULT now() |
 | `lifted_at` | timestamptz | nullable — if suppression was later reversed |
 | `lift_reason` | text | nullable |
-| `created_at` | timestamptz | |
+| `created_at` | timestamptz | NOT NULL DEFAULT now() |
+
+**Note on suppressed_at vs created_at:** Both default to `now()` on INSERT and should never diverge in practice. The redundancy is intentional for audit clarity: `created_at` is the universal row-creation convention present on all tables; `suppressed_at` is the human-readable semantic field ("when suppression took effect"). Migration: both must be `NOT NULL DEFAULT now()`. If they ever diverge (e.g. due to a manual SQL fix), treat `suppressed_at` as authoritative for suppression logic and `created_at` as authoritative for row provenance.
 
 PARTIAL UNIQUE INDEX: `CREATE UNIQUE INDEX ON suppressed_entities (entity_type, entity_id) WHERE lifted_at IS NULL` — allows re-suppression after a suppression has been lifted. No full `UNIQUE` constraint (would block INSERT after lift). No `updated_at` — immutable; use `lifted_at` to record reversal.
 
@@ -1511,6 +1558,7 @@ PK: `(user_id, media_type, media_id)`
 | `slug_redirects` | `old_slug` | UNIQUE | Redirect lookups |
 | `slug_redirects` | `new_case_id` | btree | FK join — sync_slug_redirect trigger queries this on every case slug change |
 | `jurisdictions` | `state_code` | btree | State SEO pages |
+| `cases` | `country_code` | btree | International filtering / SEO pages |
 | `cases` | `state_code` | btree | /state/california pages |
 | `cases` | `year` | btree | /year/1994 pages |
 | `cases` | `jurisdiction_id` | btree | FK join |
@@ -1525,6 +1573,7 @@ PK: `(user_id, media_type, media_id)`
 | `content_takedown_requests` | `response_deadline` | partial (`WHERE resolved_at IS NULL`) | Overdue SLA alerts |
 | `suppressed_entities` | `(entity_type, entity_id)` | partial UNIQUE (`WHERE lifted_at IS NULL`) | One active suppression per entity; allows re-suppression after lift |
 | `moderation_actions` | `(entity_type, entity_id)` | btree | Audit trail per entity |
+| `moderation_actions` | `(entity_type, entity_id, action_type, agent_source)` | btree | Covering index for publish gate query (`WHERE entity_type='cases' AND entity_id=X AND action_type='approved' AND agent_source='human'`) |
 | `moderation_actions` | `moderator_id` | btree | Actions per moderator |
 | `case_agencies` | `agency_id` | btree | "Cases per agency" reverse lookup |
 | `charges` | `case_person_id` | btree | FK join — primary access path |
