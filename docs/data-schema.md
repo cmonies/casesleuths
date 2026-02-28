@@ -102,7 +102,7 @@ SELECT
     WHEN p.name_display_policy = 'initials_only' THEN
       array_to_string(ARRAY(
         SELECT left(word, 1) || '.'
-        FROM unnest(string_to_array(p.name, ' ')) AS word
+        FROM unnest(string_to_array(p.name, ' ')) AS word WHERE word <> ''  -- guard: skip empty tokens from double spaces
       ), ' ')
     WHEN p.name_display_policy = 'auto' THEN '[Review required]'
     -- 'auto': cannot safely resolve without case context; use public_case_people instead
@@ -181,8 +181,8 @@ WHERE c.deleted_at IS NULL;
 -- Routing logic (both views are anon-accessible via RLS policies):
 --   SELECT * FROM public_cases WHERE slug = $slug → found = 200 OK
 --   SELECT * FROM public_cases WHERE slug = $slug → not found:
---     SELECT * FROM public_case_tombstones WHERE original_slug = $slug → found = 410 Gone
---     SELECT * FROM public_case_tombstones WHERE original_slug = $slug → not found = 404 Not Found
+--     SELECT * FROM public_case_tombstones WHERE slug = $slug → found = 410 Gone
+--     SELECT * FROM public_case_tombstones WHERE slug = $slug → not found = 404 Not Found
 -- Anon never queries base `cases` table — routing is entirely via these two views.
 -- Note: slug_redirects handles renamed slugs; check slug_redirects BEFORE tombstones
 -- if you want clean redirect chains (old_slug → new_slug before checking suppression).
@@ -227,7 +227,35 @@ CREATE POLICY "auth_insert_upvote" ON upvotes FOR INSERT TO authenticated
 CREATE POLICY "auth_delete_own_upvote" ON upvotes FOR DELETE TO authenticated
   USING (user_id = auth.uid());
 ```
-Note: Full RLS policy set (community features, community_notes writes, content_reports) is written in the Supabase migration file. The above is the minimum required architecture — the key rule is NO direct anon access to base tables.
+-- REQUIRED: ongoing_trial community lock — these policies MUST be in the migration
+-- community_notes INSERT: block on ongoing_trial cases
+CREATE POLICY "block_ongoing_trial_notes" ON community_notes FOR INSERT TO authenticated
+  WITH CHECK (
+    NOT EXISTS (
+      SELECT 1 FROM cases WHERE id = community_notes.case_id AND status = 'ongoing_trial'
+    )
+  );
+-- community_corrections INSERT: same gate
+CREATE POLICY "block_ongoing_trial_corrections" ON community_corrections FOR INSERT TO authenticated
+  WITH CHECK (
+    NOT EXISTS (
+      SELECT 1 FROM cases WHERE id = community_corrections.case_id AND status = 'ongoing_trial'
+    )
+  );
+-- upvotes INSERT: block on ongoing_trial cases (entity_type='community_notes' only in MVP;
+-- join through community_notes.case_id to reach cases.status)
+CREATE POLICY "block_ongoing_trial_upvotes" ON upvotes FOR INSERT TO authenticated
+  WITH CHECK (
+    NOT EXISTS (
+      SELECT 1 FROM community_notes cn
+      JOIN cases c ON c.id = cn.case_id
+      WHERE cn.id = upvotes.entity_id
+        AND upvotes.entity_type = 'community_notes'
+        AND c.status = 'ongoing_trial'
+    )
+  );
+
+Note: The above ongoing_trial lock policies are REQUIRED in the migration — this is an explicit legal safety rule. The remaining full RLS policy set (auth reads for community tables, content_reports) is written in the migration file. The key rule is NO direct anon access to base tables.
 
 **`public_people` is ADMIN/EDITORIAL USE ONLY — not for public pages.** It returns `'[Review required]'` for `auto` policy persons, which would create confusing UX if used on public-facing routes. Public search, Typesense indexing, and all user-visible pages MUST use `public_case_people` (case-scoped view below). `public_people` is safe for admin dashboards and editorial review tools only.
 
@@ -247,7 +275,7 @@ SELECT
     WHEN p.name_display_policy = 'initials_only' THEN
       array_to_string(ARRAY(
         SELECT left(word, 1) || '.'
-        FROM unnest(string_to_array(p.name, ' ')) AS word
+        FROM unnest(string_to_array(p.name, ' ')) AS word WHERE word <> ''  -- guard: skip empty tokens from double spaces
       ), ' ')
     WHEN p.name_display_policy = 'auto' THEN
       CASE
@@ -261,7 +289,7 @@ SELECT
         WHEN p.is_minor_at_time_of_crime = true AND cp.legal_status = 'alleged' THEN
           array_to_string(ARRAY(
             SELECT left(word, 1) || '.'
-            FROM unnest(string_to_array(p.name, ' ')) AS word
+            FROM unnest(string_to_array(p.name, ' ')) AS word WHERE word <> ''  -- guard: skip empty tokens from double spaces
           ), ' ')
         -- 4. Minor at time + POI/no charges/witness → initials only
         WHEN p.is_minor_at_time_of_crime = true
@@ -269,7 +297,7 @@ SELECT
              THEN
           array_to_string(ARRAY(
             SELECT left(word, 1) || '.'
-            FROM unnest(string_to_array(p.name, ' ')) AS word
+            FROM unnest(string_to_array(p.name, ' ')) AS word WHERE word <> ''  -- guard: skip empty tokens from double spaces
           ), ' ')
         -- 5. Aged-out minor (was minor at time, now adult, still living) → human review required
         WHEN p.is_minor_at_time_of_crime = true
@@ -1072,7 +1100,7 @@ Supports group interviews.
 | `person_id` | uuid | FK → people (RESTRICT) |
 | `role` | text | CHECK (`role IN ('interviewee', 'interviewer')`). Only two valid values — a CHECK is appropriate here. |
 
-PK: `(interview_id, person_id)`
+PK: `(interview_id, person_id, role)` — role included in PK to allow same person as both interviewer and interviewee in edge cases (Q&A formats, host-turned-subject). UNIQUE(interview_id, person_id) without role would prevent this legitimate modeling.
 
 ---
 
@@ -1206,7 +1234,7 @@ Retention: keep top 50 posts per case by score. Upsert on `post_id` UNIQUE on ea
 |-------|------|-------|
 | `id` | uuid | PK |
 | `case_id` | uuid | NOT NULL, FK → cases (ON DELETE CASCADE) |
-| `subreddit_id` | uuid | FK → case_subreddits (SET NULL on delete) — null if post from non-curated subreddit. **Cross-case constraint:** `subreddit_id` must belong to the same `case_id` as this post. Migration must add: `CHECK` is not expressible as a simple constraint (requires subquery); enforce via trigger or application layer. Agent A must only set `subreddit_id` from rows in `case_subreddits` where `case_subreddits.case_id = case_reddit_posts.case_id`. |
+| `subreddit_id` | uuid | FK → case_subreddits (SET NULL on delete) — null if post from non-curated subreddit. **Cross-case constraint:** migration MUST add a BEFORE INSERT OR UPDATE trigger: `RAISE EXCEPTION` if `subreddit_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM case_subreddits WHERE id = NEW.subreddit_id AND case_id = NEW.case_id)`. Not expressible as a simple CHECK (requires subquery). Trigger is required — app-layer-only is insufficient given service-role writes by agents. |
 | `post_id` | text | UNIQUE — Reddit base36 ID, deduplication key |
 | `title` | text | |
 | `subreddit` | text | Denormalized for display |
@@ -1313,7 +1341,7 @@ Citation trail — defamation defense. Every factual claim should have a source 
 | `created_at` | timestamptz | |
 | `updated_at` | timestamptz | |
 
-**URL canonicalization required before INSERT:** strip UTM params, normalize trailing slash, lowercase scheme+host. Use a helper function in the app layer — do NOT rely on the DB to normalize. `sources.url UNIQUE` deduplication is case-sensitive in Postgres; inconsistent normalization will cause duplicate rows. **Migration must add a case-insensitive functional unique index:** `CREATE UNIQUE INDEX sources_url_lower_unique ON sources (lower(url));` and drop the plain UNIQUE constraint, OR store urls always-lowercased via a BEFORE INSERT trigger. Canonical form: `https://host.com/path` (no trailing slash, no query params except content-relevant ones).
+**URL canonicalization required before INSERT:** strip UTM params, normalize trailing slash, lowercase scheme+host. Use a helper function in the app layer — do NOT rely on the DB to normalize. `sources.url UNIQUE` deduplication is case-sensitive in Postgres; inconsistent normalization will cause duplicate rows. **Migration MUST: (1) NOT add a plain UNIQUE constraint on `url`; (2) add `CREATE UNIQUE INDEX sources_url_lower_unique ON sources (lower(url));` instead.** This is the canonical approach — do not use a plain UNIQUE + normalization trigger (two mechanisms can diverge). The functional index handles deduplication; app layer handles canonicalization before insert. Canonical form: `https://host.com/path` (no trailing slash, no query params except content-relevant ones).
 
 ### `entity_sources` (pure join — no timestamps)
 
@@ -1590,7 +1618,7 @@ PK: `(user_id, media_type, media_id)`
 | `tv_shows` | `tmdb_id` | UNIQUE | TMDB deduplication |
 | `tv_shows` | `imdb_id` | UNIQUE | IMDB deduplication |
 | `news_articles` | `url` | UNIQUE | News deduplication |
-| `sources` | `url` | UNIQUE | Citation deduplication |
+| `sources` | `url` | `CREATE UNIQUE INDEX sources_url_lower_unique ON sources (lower(url))` | Citation deduplication (case-insensitive functional index — do NOT use plain UNIQUE) |
 | `news_articles` | `published_at` | btree | Recent articles listing |
 | `slug_redirects` | `old_slug` | UNIQUE | Redirect lookups |
 | `slug_redirects` | `new_case_id` | btree | FK join — sync_slug_redirect trigger queries this on every case slug change |
