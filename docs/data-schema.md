@@ -232,6 +232,15 @@ $$ LANGUAGE plpgsql;
 -- CREATE TRIGGER check_source_coverage BEFORE UPDATE ON cases
 --   FOR EACH ROW EXECUTE FUNCTION check_source_coverage();
 
+-- cases DELETE block: cases are never hard-deleted; enforces soft-delete-only policy
+CREATE OR REPLACE FUNCTION block_case_hard_delete() RETURNS TRIGGER AS $$
+BEGIN
+  RAISE EXCEPTION 'Hard delete on cases is forbidden. Set deleted_at instead. Case id: %', OLD.id;
+END;
+$$ LANGUAGE plpgsql;
+-- CREATE TRIGGER block_case_hard_delete BEFORE DELETE ON cases
+--   FOR EACH ROW EXECUTE FUNCTION block_case_hard_delete();
+
 -- cases INSERT guard: new cases must start as 'draft'; blocks INSERT bypass of pipeline
 CREATE OR REPLACE FUNCTION enforce_cases_insert_draft() RETURNS TRIGGER AS $$
 BEGIN
@@ -266,8 +275,12 @@ BEGIN
     RAISE EXCEPTION 'Invalid review_status transition: % → %', OLD.review_status, NEW.review_status;
   END IF;
   -- Log transition to moderation_actions (agent_source set by caller via session variable or default)
+  -- agent_source contract: callers MUST SET LOCAL app.agent_source = 'agent_a' (or valid value)
+  -- before updating review_status. Trigger defaults to 'system' if not set.
+  -- Valid values: 'agent_a','agent_b','agent_c','agent_d','human','system'
   INSERT INTO moderation_actions (entity_type, entity_id, action_type, agent_source, metadata)
-  VALUES ('cases', NEW.id, 'edited', current_setting('app.agent_source', true),
+  VALUES ('cases', NEW.id, 'edited',
+    COALESCE(NULLIF(current_setting('app.agent_source', true), ''), 'system'),
     jsonb_build_object('field', 'review_status', 'from', OLD.review_status, 'to', NEW.review_status));
   RETURN NEW;
 END;
@@ -490,7 +503,7 @@ Case
 | Field | Type | Notes |
 |-------|------|-------|
 | `id` | uuid | PK |
-| `slug` | text | NOT NULL, UNIQUE, URL-safe |
+| `slug` | text | NOT NULL, UNIQUE, URL-safe. CHECK (`slug ~ '^[a-z0-9]+(-[a-z0-9]+)*$'`) — lowercase alphanumeric, hyphens only, no leading/trailing hyphens. UNIQUE is case-sensitive in Postgres (fine — slugs are always lowercase by this CHECK). |
 | `title` | text | NOT NULL |
 | `alternate_names` | text[] | NOT NULL DEFAULT '{}' |
 | `status` | enum | NOT NULL — `unsolved` · `solved_convicted` · `solved_acquitted` · `solved_exonerated` · `ongoing_trial` · `cold_case` · `civil_resolution` · `closed_no_crime` · `closed_suspect_deceased` |
@@ -498,17 +511,17 @@ Case
 | `content_warnings` | text[] | NOT NULL DEFAULT '{}' — Controlled list: `child_victim` · `sexual_violence` · `infant_victim` · `family_violence` · `mass_casualty` · `graphic_imagery_risk` |
 | `jurisdiction_id` | uuid | FK → jurisdictions (SET NULL) — nullable |
 | `location_city` | text | |
-| `location_state` | text | |
-| `location_country` | text | default `US` |
-| `state_code` | text | 2-letter US state code — for /state/california SEO pages |
-| `country_code` | text | NOT NULL default `US` — for international filtering |
+| `location_state` | text | **Display field** — full state name e.g. `California`. Not used for filtering. |
+| `location_country` | text | **Display field** — full country name e.g. `United States`. Not used for filtering. |
+| `state_code` | text | **Filter/SEO field** — 2-letter US state code e.g. `CA`. CHECK (`state_code ~ '^[A-Z]{2}$'`) when NOT NULL. Used for /state/california pages. NULL for non-US cases. |
+| `country_code` | text | NOT NULL default `US` — **Filter/SEO field** — ISO 3166-1 alpha-2 e.g. `US`, `GB`. CHECK (`country_code ~ '^[A-Z]{2}$'`). Used for international filtering. Canonical: when `country_code != 'US'`, `state_code` MUST be NULL. |
 | `location_coords` | point | lat/lng |
 | `date_start` | date | |
 | `date_end` | date | nullable |
 | `year` | int | **Trigger-maintained** (not GENERATED ALWAYS AS — Supabase doesn't support it reliably). The `sync_case_year` trigger unconditionally sets `year = EXTRACT(YEAR FROM date_start)` on every INSERT and UPDATE where `date_start IS NOT NULL`. If `date_start IS NULL`, `year` remains NULL. **Manual year overrides are not supported** — to set a custom year, you must set `date_start` accordingly or patch via a direct admin UPDATE that bypasses the trigger (service role only, log in `moderation_actions`). Nullable — cold cases without a known date have `year = NULL`. Used for /year/1994 SEO pages. |
 | `summary` | text | |
-| `body` | text | Plain Markdown |
-| `disclaimer` | text | Shown prominently — e.g. "No one has been charged in this case." |
+| `body` | text | NOT NULL. CHECK (`length(trim(body)) > 0`) — empty body forbidden. Agent A must write ≥ 500 words; checked by Agent B, not enforced at DB level (word count is too complex for a CHECK). |
+| `disclaimer` | text | Shown prominently — e.g. "No one has been charged in this case." CHECK (`disclaimer IS NULL OR length(trim(disclaimer)) > 0`) — if set, cannot be blank string. |
 | `seo_title` | text | |
 | `seo_description` | text | |
 | `cover_image_url` | text | |
@@ -518,7 +531,7 @@ Case
 | `review_status` | enum | NOT NULL DEFAULT `draft` — pipeline gate, see `docs/data-pipeline.md`. **Valid transitions only:** `draft→legal_review`, `legal_review→qa_review`, `legal_review→draft` (Agent B FAIL), `qa_review→approved`, `qa_review→legal_review` (Agent C vocab-only fix), `qa_review→draft` (Agent C body-rewrite needed), `approved→published`, `approved→legal_review` (source coverage gate fail — system job), `any→rejected` (admin only), `any→suppressed` (takedown), `suppressed→legal_review` (admin-initiated unsuppression only). Enforced by app layer + state machine trigger (SQL below). `rejected` = permanently blocked (admin decision, not Agent B/C FAIL). |
 | `revision_count` | int | NOT NULL DEFAULT 0 — incremented on each Agent B/C FAIL → draft cycle; escalates to human review after 3 |
 | `published_at` | timestamptz | null = draft. Never auto-set for `legal_sensitivity: high`. Must be accompanied by `review_status: published`. CHECK: `((published_at IS NOT NULL) = (review_status = 'published'))` — true biconditional: `published_at` present ↔ `review_status` is `published`. Prevents both (a) `published_at` set on a draft, and (b) `review_status: published` with no timestamp. |
-| `deleted_at` | timestamptz | Soft delete. Cases are NEVER hard-deleted — destroys audit trail. Set `deleted_at` instead. RLS hides from all public queries. |
+| `deleted_at` | timestamptz | Soft delete. Cases are NEVER hard-deleted — destroys audit trail. Set `deleted_at` instead. RLS hides from all public queries. A `BEFORE DELETE` trigger (see trigger SQL section) raises an exception on any DELETE attempt. Child FK cascades (timeline_events, case_people, etc.) exist but can never fire because the parent cases row cannot be deleted. This resolves the apparent contradiction between "never hard-delete" and `ON DELETE CASCADE` on child tables. |
 | `created_at` | timestamptz | |
 | `updated_at` | timestamptz | |
 
@@ -542,7 +555,7 @@ Case
 | Field | Type | Notes |
 |-------|------|-------|
 | `id` | uuid | PK |
-| `slug` | text | NOT NULL, UNIQUE |
+| `slug` | text | NOT NULL, UNIQUE. CHECK (`slug ~ '^[a-z0-9]+(-[a-z0-9]+)*$'`). |
 | `label` | text | NOT NULL |
 | `description` | text | |
 | `created_at` | timestamptz | |
@@ -565,7 +578,7 @@ PK: `(case_id, tag_id)`
 |-------|------|-------|
 | `case_id_a` | uuid | FK → cases (ON DELETE CASCADE) |
 | `case_id_b` | uuid | FK → cases (ON DELETE CASCADE) |
-| `relationship_type` | text | e.g. `same_alleged_person` · `same_jurisdiction` · `connected_victim` · `linked_investigation` |
+| `relationship_type` | text | **Intentionally free-form** — not a CHECK/enum. Common values: `same_alleged_person` · `same_jurisdiction` · `connected_victim` · `linked_investigation` · `same_series` · `cold_case_reopened`. Free-form allows novel relationship types without a migration. Typesense indexes this field for filtering; document new values in `docs/taxonomy.md` (to be created) when introduced. |
 | `notes` | text | |
 
 PK: `(case_id_a, case_id_b)`
@@ -579,8 +592,8 @@ CONSTRAINT: `CHECK (case_id_a < case_id_b)` — prevents `(A,B)` and `(B,A)` dup
 |-------|------|-------|
 | `id` | uuid | PK |
 | `case_id` | uuid | FK → cases (ON DELETE CASCADE) |
-| `question` | text | |
-| `answer` | text | |
+| `question` | text | NOT NULL. CHECK (`length(trim(question)) > 0`). |
+| `answer` | text | NOT NULL. CHECK (`length(trim(answer)) > 0`). |
 | `sort_order` | int | |
 | `created_at` | timestamptz | |
 | `updated_at` | timestamptz | |
@@ -594,11 +607,11 @@ CONSTRAINT: `CHECK (case_id_a < case_id_b)` — prevents `(A,B)` and `(B,A)` dup
 | `id` | uuid | PK |
 | `case_id` | uuid | FK → cases (ON DELETE CASCADE) |
 | `date` | date | |
-| `date_precision` | enum | `exact` · `approximate` · `year_only` |
+| `date_precision` | enum | NOT NULL DEFAULT `approximate` — `exact` · `approximate` · `year_only`. CHECK (implied by NOT NULL): if `date IS NULL` then `date_precision` should be `approximate` (unknown date). Agent A must always set this field. |
 | `event_type` | enum | `crime_event` · `discovery` · `arrest` · `indictment` · `trial_start` · `verdict` · `sentencing` · `appeal_filed` · `appeal_ruling` · `release` · `death` · `media_coverage` · `other` |
 | `title` | text | |
 | `description` | text | |
-| `source_url` | text | Citation |
+| `source_url` | text | **Legacy citation shortcut** — quick single-source field for Agent A data entry. Must correspond to a `sources.url` value linked via `entity_sources` before publish. The source coverage gate checks `entity_sources`, not this field. If `source_url` is set, Agent B must verify a matching `entity_sources` record exists — mismatches are flagged as P1. Do not rely on `source_url` alone; it is not part of the audit-trail citation model. |
 | `media_url` | text | Optional image/doc |
 | `event_tags` | text[] | **Intentionally denormalized** — local timeline filtering only, not browsable on tag pages |
 | `sort_order` | int | |
@@ -612,7 +625,7 @@ CONSTRAINT: `CHECK (case_id_a < case_id_b)` — prevents `(A,B)` and `(B,A)` dup
 | Field | Type | Notes |
 |-------|------|-------|
 | `id` | uuid | PK |
-| `slug` | text | NOT NULL, UNIQUE, URL-safe — for person SEO pages |
+| `slug` | text | NOT NULL, UNIQUE, URL-safe. CHECK (`slug ~ '^[a-z0-9]+(-[a-z0-9]+)*$'`) — same pattern as cases.slug. |
 | `name` | text | NOT NULL |
 | `aliases` | text[] | NOT NULL DEFAULT '{}' |
 | `primary_known_role` | `person_legal_status` enum | **Display hint only.** Source of truth is `case_people.legal_status`. Same enum type as `case_people.legal_status`. |
@@ -640,7 +653,7 @@ Surrogate PK supports multi-role per case (e.g. initially `witness`, later `alle
 | `person_id` | uuid | FK → people (ON DELETE RESTRICT) |
 | `legal_status` | enum | NOT NULL — **Source of truth.** Values: `victim` · `alleged` · `convicted` · `acquitted` · `exonerated` · `charges_dropped` · `person_of_interest` · `no_charges_filed` · `witness` · `detective` · `attorney` · `judge` · `other` |
 | `notes` | text | Case-specific context |
-| `is_primary` | bool | Flag most prominent role when multiple rows exist per person |
+| `is_primary` | bool | NOT NULL DEFAULT false — flags the most prominent person(s) for a case. **Multiple `is_primary = true` rows per case are intentionally allowed** (e.g. a case with two co-defendants can have both flagged). No UNIQUE constraint. UI should display all primary-flagged persons prominently. If editorial intent is "exactly one primary", enforce at application layer, not DB. |
 | `created_at` | timestamptz | |
 | `updated_at` | timestamptz | |
 
@@ -659,7 +672,7 @@ UNIQUE: `(case_id, person_id)` — **one row per person per case**. `legal_statu
 | Field | Type | Notes |
 |-------|------|-------|
 | `id` | uuid | PK |
-| `slug` | text | NOT NULL, UNIQUE, URL-safe |
+| `slug` | text | NOT NULL, UNIQUE, URL-safe. CHECK (`slug ~ '^[a-z0-9]+(-[a-z0-9]+)*$'`). |
 | `name` | text | NOT NULL |
 | `type` | enum | `local_pd` · `sheriff` · `fbi` · `da` · `state_police` · `other` _(US-centric v1 — known tech debt)_ |
 | `jurisdiction` | text | |
@@ -926,6 +939,25 @@ Structured legal proceedings per person per case. `case_people.legal_status` is 
 
 **Display note:** Active appeal → show "Convicted (appealing)" rather than "Convicted" on case pages.
 
+**Cross-person integrity:** If `charge_id` is set, it must belong to the same `case_person_id` as the appeal — `charges.case_person_id = appeals.case_person_id`. Enforced via trigger:
+```sql
+CREATE OR REPLACE FUNCTION check_appeal_charge_consistency() RETURNS TRIGGER AS $$
+BEGIN
+  IF NEW.charge_id IS NOT NULL THEN
+    IF NOT EXISTS (
+      SELECT 1 FROM charges
+      WHERE id = NEW.charge_id AND case_person_id = NEW.case_person_id
+    ) THEN
+      RAISE EXCEPTION 'appeals.charge_id % does not belong to case_person_id %', NEW.charge_id, NEW.case_person_id;
+    END IF;
+  END IF;
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+-- CREATE TRIGGER check_appeal_charge_consistency BEFORE INSERT OR UPDATE ON appeals
+--   FOR EACH ROW EXECUTE FUNCTION check_appeal_charge_consistency();
+```
+
 ---
 
 ### `sources`
@@ -957,6 +989,8 @@ Links sources to any entity (case, person, timeline event, evidence, etc.) with 
 | `notes` | text | nullable |
 
 PK: `(source_id, entity_type, entity_id)`
+
+**Orphan cleanup policy:** `entity_sources.entity_id` has no Postgres FK (polymorphic reference). When a referenced entity is deleted or soft-deleted, `entity_sources` rows must be cleaned up manually. Policy: (a) Agent D nightly scan flags any `entity_sources` row where the referenced `entity_id` no longer exists in the target table — treat as data integrity error; (b) Hard deletes cascade from `cases` → `timeline_events` but NOT into `entity_sources` (no FK). App layer must issue `DELETE FROM entity_sources WHERE entity_type='timeline_events' AND entity_id=...` when deleting timeline events. Suppressed entities: do NOT delete their `entity_sources` records — suppression is display-only, not data deletion.
 
 ---
 
@@ -1028,7 +1062,7 @@ PK: `(case_id, book_id)`
 
 PK: `(user_id, entity_type, entity_id)` — naturally prevents double-upvotes.
 
-CONSTRAINT: `CHECK (entity_type IN ('community_notes'))` — extend this list as more entities become upvotable. Prevents trigger runtime errors from bad entity_type values.
+CONSTRAINT: `CHECK (entity_type IN ('community_notes'))` — **canonical list of upvotable tables**. Each table in this list MUST have `upvote_count int NOT NULL DEFAULT 0 CHECK (upvote_count >= 0)` and be covered by the nightly reconciliation cron. To make a new entity upvotable: (1) add `upvote_count` to the table, (2) add its name to this CHECK, (3) add a nightly reconciliation query in `docs/data-pipeline.md`. Do not add a table to this CHECK without also adding `upvote_count` — the trigger will fail at runtime with "column does not exist".
 
 ### `community_notes`
 
@@ -1038,7 +1072,7 @@ CONSTRAINT: `CHECK (entity_type IN ('community_notes'))` — extend this list as
 | `case_id` | uuid | FK → cases (ON DELETE CASCADE) |
 | `parent_id` | uuid | FK → community_notes (self-ref, nullable) ON DELETE SET NULL — if parent is moderated/removed, replies are not deleted; they become top-level |
 | `user_id` | uuid | FK → profiles (ON DELETE SET NULL) |
-| `body` | text | |
+| `body` | text | NOT NULL. CHECK (`length(trim(body)) > 0`). CHECK (`length(body) <= 50000`) — 50k char cap prevents runaway inserts. |
 | `upvote_count` | int | NOT NULL DEFAULT 0, CHECK (upvote_count >= 0) — trigger-maintained; trigger uses `GREATEST(upvote_count - 1, 0)` to prevent negative counts on duplicate deletes |
 | `is_pinned` | bool | NOT NULL DEFAULT false |
 | `deleted_at` | timestamptz | Soft delete. UI shows "[removed]". RLS blocks new upvotes (`WHERE deleted_at IS NULL`). `upvote_count` preserved (not zeroed) — restored notes recover their signal. |
