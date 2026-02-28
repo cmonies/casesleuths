@@ -82,7 +82,11 @@ Reddit's model (and ours): **optimistic updates + Supabase Realtime push**.
 
 **Minimum source coverage gate:** A publish trigger blocks `review_status = 'published'` unless the case has at least: 1 source in `entity_sources` linked to `cases`, and 1 source linked to each `timeline_event` in the case. Enforced at DB level — not process-only.
 
-**Typesense indexing + suppression:** All Typesense indexing jobs must JOIN against `suppressed_entities WHERE lifted_at IS NULL` and redact suppressed entities before indexing. Suppressed persons must not appear in search results even if the case page shows "[Name withheld]". Indexing jobs must use the `public_people` and `public_cases` views defined below — never query `people` or `cases` directly.
+**Typesense indexing + suppression:** All Typesense indexing jobs must use the safe views — never query `people`, `cases`, or `case_people` base tables directly. Routing:
+- Case index: use `public_cases` view (filters suppressed + unpublished)
+- Person name resolution in search snippets: use `public_case_people` view (case-scoped, full auto-policy resolution)
+- Person details (admin/editorial only): use `public_people` view
+Suppressed persons must not appear in search results. The `public_case_people` view handles suppression via LEFT JOIN on `suppressed_entities`. Typesense indexing jobs must also pass results through this view — not apply suppression logic independently.
 
 **Suppression-safe views (define in migration before any RLS policies):**
 ```sql
@@ -91,7 +95,7 @@ CREATE OR REPLACE VIEW public_people AS
 SELECT
   p.id,
   CASE
-    WHEN se.id IS NOT NULL THEN '[Name withheld]'
+    WHEN se_person.id IS NOT NULL THEN '[Name withheld]'
     WHEN p.name_display_policy IN ('redacted', 'requires_human_review') THEN '[Name withheld]'
     WHEN p.name_display_policy = 'initials_only' THEN
       array_to_string(ARRAY(
@@ -103,7 +107,7 @@ SELECT
     ELSE p.name
   END AS display_name,
   CASE
-    WHEN se.id IS NOT NULL THEN NULL
+    WHEN se_person.id IS NOT NULL THEN NULL
     WHEN p.photo_display_policy IN ('blocked', 'requires_review') THEN NULL
     WHEN p.name_display_policy IN ('auto', 'requires_human_review') THEN NULL -- safe: no photo without resolved name
     ELSE p.photo_url
@@ -158,7 +162,34 @@ WHERE c.deleted_at IS NULL
   AND se.id IS NULL
   AND c.review_status = 'published';
 ```
-Note: Add `WITH (security_barrier = true)` if using Supabase RLS alongside these views for maximum safety.
+All views must be created with `WITH (security_barrier = true)` to prevent predicate pushdown attacks.
+
+**Required RLS policies (migration must include these):**
+```sql
+-- Block anon + authenticated from reading base tables directly
+ALTER TABLE people ENABLE ROW LEVEL SECURITY;
+ALTER TABLE cases ENABLE ROW LEVEL SECURITY;
+ALTER TABLE case_people ENABLE ROW LEVEL SECURITY;
+
+-- Anon: read-only access via views only (no direct base table access)
+CREATE POLICY "anon_read_public_cases" ON cases FOR SELECT TO anon
+  USING (review_status = 'published' AND deleted_at IS NULL
+    AND NOT EXISTS (SELECT 1 FROM suppressed_entities se
+      WHERE se.entity_type = 'cases' AND se.entity_id = id AND se.lifted_at IS NULL));
+
+CREATE POLICY "anon_read_people" ON people FOR SELECT TO anon
+  USING (name_display_policy != 'redacted'
+    AND NOT EXISTS (SELECT 1 FROM suppressed_entities se
+      WHERE se.entity_type = 'people' AND se.entity_id = id AND se.lifted_at IS NULL));
+
+CREATE POLICY "anon_read_case_people" ON case_people FOR SELECT TO anon
+  USING (EXISTS (SELECT 1 FROM cases c WHERE c.id = case_id
+    AND c.review_status = 'published' AND c.deleted_at IS NULL));
+
+-- Service role (agents, admin) bypass RLS — uses service_role key in Supabase
+-- All other roles: deny by default (no policy = no access)
+```
+Note: The above are minimum required policies. Full RLS policy set (for community features, upvotes, moderation) is written in the Supabase migration file, not this spec. Migration writer must implement complete RLS before launch.
 
 **`public_people` is ADMIN/EDITORIAL USE ONLY — not for public pages.** It returns `'[Review required]'` for `auto` policy persons, which would create confusing UX if used on public-facing routes. Public search, Typesense indexing, and all user-visible pages MUST use `public_case_people` (case-scoped view below). `public_people` is safe for admin dashboards and editorial review tools only.
 
@@ -202,10 +233,16 @@ SELECT
   CASE
     WHEN se.id IS NOT NULL THEN NULL
     WHEN p.photo_display_policy IN ('blocked', 'requires_review') THEN NULL
-    WHEN p.name_display_policy IN ('redacted') THEN NULL
+    WHEN p.name_display_policy IN ('redacted', 'requires_human_review') THEN NULL
+    -- Block photo whenever name is being withheld by auto-policy (minor protection)
+    WHEN p.name_display_policy = 'auto' AND (
+      p.is_minor_currently = true
+      OR (p.is_minor_at_time_of_crime = true AND NOT cp.charged_as_adult)
+    ) THEN NULL
     ELSE p.photo_url
   END AS display_photo_url,
   cp.legal_status,
+  cp.case_role,
   cp.notes,
   cp.is_primary,
   p.slug,
@@ -217,9 +254,17 @@ SELECT
   p.photo_display_policy
 FROM case_people cp
 JOIN people p ON p.id = cp.person_id
-LEFT JOIN suppressed_entities se
-  ON se.entity_type = 'people' AND se.entity_id = p.id AND se.lifted_at IS NULL;
+-- Only include people on published, non-deleted, non-suppressed cases
+JOIN cases c ON c.id = cp.case_id
+  AND c.review_status = 'published'
+  AND c.deleted_at IS NULL
+LEFT JOIN suppressed_entities se_person
+  ON se_person.entity_type = 'people' AND se_person.entity_id = p.id AND se_person.lifted_at IS NULL
+LEFT JOIN suppressed_entities se_case
+  ON se_case.entity_type = 'cases' AND se_case.entity_id = c.id AND se_case.lifted_at IS NULL
+WHERE se_case.id IS NULL; -- exclude suppressed cases entirely
 ```
+Note: the `se` variable in the CASE statement above refers to `se_person`. Update the view definition to use `se_person` instead of `se` for clarity in the migration SQL.
 
 **Indexing rule:** Typesense jobs use `public_case_people` for person name resolution in search. `public_people` is for admin/editorial UIs that need the full person record without case context.
 
@@ -484,11 +529,23 @@ See `docs/legal-safety-framework.md` for full policy. Key constraints:
 - **Ongoing trial lock**: `status = 'ongoing_trial'` blocks community contributions via RLS.
 - **Legal review skill** (planned): evaluates every case page against this framework before publish. Checks vocabulary compliance, disclaimer presence, `legal_sensitivity` classification, content warning completeness.
 
-**Person legal status — controlled vocabulary (use these exact values, no others):**
+**Person controlled vocabulary — two separate enums (v0.16 split):**
+
+`case_people.case_role` (`case_role` enum) — functional role in the case:
 
 | Value | When to use |
 |-------|-------------|
 | `victim` | Victim of the crime |
+| `witness` | Witness to events |
+| `detective` | Investigator on the case |
+| `attorney` | Defense, prosecution, or civil attorney |
+| `judge` | Presiding judge |
+| `other` | Any other functional role |
+
+`case_people.legal_status` (`person_legal_status` enum) — legal standing; **nullable** for role-only persons:
+
+| Value | When to use |
+|-------|-------------|
 | `alleged` | Formally charged, trial pending |
 | `convicted` | Conviction currently stands (note if appealing) |
 | `acquitted` | Charged, found not guilty |
@@ -496,11 +553,8 @@ See `docs/legal-safety-framework.md` for full policy. Key constraints:
 | `person_of_interest` | Named by investigators, not formally charged |
 | `charges_dropped` | Was formally charged; charges subsequently dropped or dismissed before trial |
 | `no_charges_filed` | Named in media or podcasts, never formally accused |
-| `witness` | Witness to events |
-| `detective` | Investigator on the case |
-| `attorney` | Defense, prosecution, or civil attorney |
-| `judge` | Presiding judge |
-| `other` | Any other role |
+
+**Rule:** `legal_status` is NULL for persons whose only relationship is a functional role (detective, attorney, judge, victim with no charges). Victims who were also charged (e.g. self-defense cases) can have both a `case_role = 'victim'` and a `legal_status = 'alleged'`.
 
 ---
 
@@ -540,7 +594,7 @@ See `docs/legal-safety-framework.md` for full policy. Key constraints:
 | `takedown_request_type` | `legal_demand` · `family_request` · `subject_request` · `minor_aged_out` · `victim_privacy` · `court_order` · `dmca` |
 | `takedown_status` | `received` · `under_review` · `complied` · `partially_complied` · `denied` · `escalated` |
 | `suppression_reason` | `legal_demand` · `court_order` · `minor_privacy` · `victim_request` · `family_request` · `editorial` |
-| `moderation_action_type` | `approved` · `rejected` · `edited` · `deleted` · `restored` · `suppressed` · `unsuppressed` · `locked` · `unlocked` |
+| `moderation_action_type` | `approved` · `rejected` · `edited` · `deleted` · `restored` · `suppressed` · `unsuppressed` · `locked` · `unlocked` · `flagged` — `flagged` is used by Agent D to log compliance alerts (e.g. minor_aged_out, is_living/dod mismatch) that require human review before action is taken |
 | `agency_type` | `local_pd` · `sheriff` · `fbi` · `da` · `state_police` · `other` |
 
 ### Agent Model Specs
@@ -1335,7 +1389,7 @@ Immutable audit log of every moderation decision. Required for legal defense.
 | `agent_source` | text | nullable — CHECK (`agent_source IN ('agent_a','agent_b','agent_c','agent_d','human','system')`). `system` = automated cron/trigger jobs. Set when `moderator_id` is null. Also subject to: CHECK `(moderator_id IS NOT NULL OR agent_source IS NOT NULL)` — at least one attribution required. Prevents orphaned audit records. |
 | `entity_type` | text | NOT NULL, CHECK (`entity_type IN ('cases','people','case_people','charges','appeals','community_notes','community_corrections','content_reports','suppressed_entities','content_takedown_requests')`) — constrained like all other entity_type columns; audit records with invalid entity_type are meaningless |
 | `entity_id` | uuid | NOT NULL |
-| `action_type` | enum | NOT NULL — `approved` · `rejected` · `edited` · `deleted` · `restored` · `suppressed` · `unsuppressed` · `locked` · `unlocked` |
+| `action_type` | enum | NOT NULL — `approved` · `rejected` · `edited` · `deleted` · `restored` · `suppressed` · `unsuppressed` · `locked` · `unlocked` · `flagged` |
 | `reason` | text | nullable |
 | `metadata` | jsonb | nullable — before/after diffs, violation lists from Agent B/C, relevant context |
 | `created_at` | timestamptz | NOT NULL DEFAULT now() — **no `updated_at`**: immutable audit log |
