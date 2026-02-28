@@ -124,7 +124,8 @@ SELECT
     -- An adult with 'auto' policy: photo visible in public (correct name shown),
     -- photo blocked in admin view (unresolved — admin must confirm policy). Intentional.
     WHEN p.name_display_policy IN ('auto', 'requires_human_review') THEN NULL
-    ELSE p.photo_url
+    WHEN p.photo_display_policy = 'allowed' THEN p.photo_url
+    ELSE NULL  -- fail-closed: unknown future photo_display_policy values block photo
   END AS display_photo_url,
   p.slug,
   -- Suppress identifying fields when name is withheld — indirect identification via bio/dob/aliases
@@ -143,8 +144,10 @@ SELECT
        OR p.name_display_policy = 'auto'
        THEN NULL ELSE p.bio END AS bio,
   p.is_living,
-  p.is_minor_at_time_of_crime,
-  p.is_minor_currently,
+  -- Suppress minor flags for suppressed persons (combined with primary_known_role, is_living,
+  -- these can narrow identification of a suppressed minor even without name/photo)
+  CASE WHEN se.id IS NOT NULL THEN NULL ELSE p.is_minor_at_time_of_crime END AS is_minor_at_time_of_crime,
+  CASE WHEN se.id IS NOT NULL THEN NULL ELSE p.is_minor_currently END AS is_minor_currently,
   p.name_display_policy,
   p.photo_display_policy,
   CASE WHEN se.id IS NOT NULL OR p.name_display_policy IN ('redacted','requires_human_review','initials_only')
