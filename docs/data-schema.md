@@ -43,7 +43,7 @@ _v0.9 · 2026-02-28 — P0 fixes: added qa_review→legal_review transition, fix
 - Tag / listing pages: `revalidate: 1800` (30 min)
 - Person / agency pages: `revalidate: 3600` (1 hour)
 
-**Revalidation implementation:** Supabase DB webhooks → Next.js `/api/revalidate?secret=TOKEN&path=/cases/[slug]`. Webhooks required on: `cases`, `timeline_events`, `case_people`, `evidence`, `interviews`, `case_faqs`, `podcast_episodes`, `tv_shows`, `news_articles`, `case_subreddits`, `case_tags`, `related_cases`.
+**Revalidation implementation:** Supabase DB webhooks → Next.js `/api/revalidate?secret=TOKEN&path=/cases/[slug]`. Webhooks required on: `cases`, `timeline_events`, `case_people`, `evidence`, `interviews`, `case_faqs`, `podcast_episodes`, `tv_shows`, `news_articles`, `case_subreddits`, `case_tags`, `related_cases`, `charges`, `appeals`, `case_agencies`, `books`, `case_books`, `jurisdictions`, `case_series`, `case_series_members`.
 
 ---
 
@@ -82,7 +82,58 @@ Reddit's model (and ours): **optimistic updates + Supabase Realtime push**.
 
 **Minimum source coverage gate:** A publish trigger blocks `review_status = 'published'` unless the case has at least: 1 source in `entity_sources` linked to `cases`, and 1 source linked to each `timeline_event` in the case. Enforced at DB level — not process-only.
 
-**Typesense indexing + suppression:** All Typesense indexing jobs must JOIN against `suppressed_entities WHERE lifted_at IS NULL` and redact suppressed entities before indexing. Suppressed persons must not appear in search results even if the case page shows "[Name withheld]". Indexing queries should use the `public_people` view (TODO: define RLS views).
+**Typesense indexing + suppression:** All Typesense indexing jobs must JOIN against `suppressed_entities WHERE lifted_at IS NULL` and redact suppressed entities before indexing. Suppressed persons must not appear in search results even if the case page shows "[Name withheld]". Indexing jobs must use the `public_people` and `public_cases` views defined below — never query `people` or `cases` directly.
+
+**Suppression-safe views (define in migration before any RLS policies):**
+```sql
+-- public_people: masks suppressed persons and enforces name_display_policy
+CREATE OR REPLACE VIEW public_people AS
+SELECT
+  p.id,
+  CASE
+    WHEN se.id IS NOT NULL THEN '[Name withheld]'
+    WHEN p.name_display_policy = 'redacted' THEN '[Name withheld]'
+    WHEN p.name_display_policy = 'initials_only' THEN
+      array_to_string(ARRAY(
+        SELECT left(word, 1) || '.'
+        FROM unnest(string_to_array(p.name, ' ')) AS word
+      ), ' ')
+    ELSE p.name
+  END AS display_name,
+  CASE
+    WHEN se.id IS NOT NULL THEN NULL
+    WHEN p.photo_display_policy IN ('blocked', 'requires_review') THEN NULL
+    ELSE p.photo_url
+  END AS display_photo_url,
+  p.slug,
+  p.aliases,
+  p.primary_known_role,
+  p.dob,
+  p.dod,
+  p.bio,
+  p.is_living,
+  p.is_minor_at_time_of_crime,
+  p.is_minor_currently,
+  p.name_display_policy,
+  p.photo_display_policy,
+  p.links,
+  p.created_at,
+  p.updated_at
+FROM people p
+LEFT JOIN suppressed_entities se
+  ON se.entity_type = 'people' AND se.entity_id = p.id AND se.lifted_at IS NULL;
+
+-- public_cases: hides soft-deleted and suppressed cases from public queries
+CREATE OR REPLACE VIEW public_cases AS
+SELECT c.*
+FROM cases c
+LEFT JOIN suppressed_entities se
+  ON se.entity_type = 'cases' AND se.entity_id = c.id AND se.lifted_at IS NULL
+WHERE c.deleted_at IS NULL
+  AND se.id IS NULL
+  AND c.review_status = 'published';
+```
+Note: Add `WITH (security_barrier = true)` if using Supabase RLS alongside these views for maximum safety. Typesense indexing jobs must SELECT from `public_people` and `public_cases` only.
 
 **Drift insurance:** Nightly reconciliation cron recomputes all `upvote_count` values from the `upvotes` table directly — cheap insurance against trigger edge cases (manual SQL, pg_restore, bulk imports).
 
@@ -97,7 +148,11 @@ $$ LANGUAGE plpgsql;
 --   podcast_episodes, tv_shows, news_articles, case_faqs, case_subreddits,
 --   profiles, community_notes, community_corrections, content_reports,
 --   slug_redirects, timeline_events, case_people, charges, appeals,
---   jurisdictions, case_series, books, content_takedown_requests, sources
+--   jurisdictions, case_series, books, content_takedown_requests, sources,
+--   user_media_progress (has updated_at; no created_at — see exception note below)
+-- Intentional exceptions (NO updated_at trigger):
+--   case_reddit_posts → uses fetched_at instead (scores updated in-place on each sync)
+--   All pure join tables (case_tags, case_agencies, case_books, etc.) → no timestamps
 
 -- Upvote count trigger (dispatches dynamically on entity_type)
 CREATE OR REPLACE FUNCTION update_upvote_count() RETURNS TRIGGER AS $$
@@ -113,12 +168,40 @@ BEGIN
   RETURN NULL;
 END;
 $$ LANGUAGE plpgsql;
--- Note: entity_type values MUST match actual table names for dynamic dispatch
+-- Note: entity_type values MUST match actual table names for dynamic dispatch.
+-- Soft-delete guard: RLS on upvotes prevents new inserts when parent deleted_at IS NOT NULL.
+-- Service-role bypass: if a service-role client inserts an upvote for a soft-deleted entity,
+-- the trigger will still fire. Accept this edge case at MVP; mitigate at scale by adding
+-- a guard in the trigger body: check parent deleted_at before updating count.
 -- CREATE TRIGGER update_upvote_count AFTER INSERT OR DELETE ON upvotes
 --   FOR EACH ROW EXECUTE FUNCTION update_upvote_count();
 ```
 
 ```sql
+-- legal_sensitivity: high publish block trigger
+-- Prevents auto-publish of high-sensitivity cases without a human approval record
+CREATE OR REPLACE FUNCTION block_high_sensitivity_autopublish() RETURNS TRIGGER AS $$
+BEGIN
+  IF NEW.review_status = 'published'
+     AND OLD.review_status != 'published'
+     AND NEW.legal_sensitivity = 'high' THEN
+    -- Check that a human explicitly approved this case (not just agent_source)
+    IF NOT EXISTS (
+      SELECT 1 FROM moderation_actions
+      WHERE entity_type = 'cases'
+        AND entity_id = NEW.id
+        AND action_type = 'approved'
+        AND agent_source = 'human'
+    ) THEN
+      RAISE EXCEPTION 'Cannot auto-publish case % with legal_sensitivity=high: human approval required', NEW.id;
+    END IF;
+  END IF;
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+-- CREATE TRIGGER block_high_sensitivity_autopublish BEFORE UPDATE ON cases
+--   FOR EACH ROW EXECUTE FUNCTION block_high_sensitivity_autopublish();
+
 -- Source coverage publish gate trigger
 -- Blocks review_status being set to 'published' unless minimum source coverage is met
 CREATE OR REPLACE FUNCTION check_source_coverage() RETURNS TRIGGER AS $$
@@ -148,6 +231,21 @@ END;
 $$ LANGUAGE plpgsql;
 -- CREATE TRIGGER check_source_coverage BEFORE UPDATE ON cases
 --   FOR EACH ROW EXECUTE FUNCTION check_source_coverage();
+
+-- cases INSERT guard: new cases must start as 'draft'; blocks INSERT bypass of pipeline
+CREATE OR REPLACE FUNCTION enforce_cases_insert_draft() RETURNS TRIGGER AS $$
+BEGIN
+  IF NEW.review_status IS DISTINCT FROM 'draft' THEN
+    RAISE EXCEPTION 'New cases must be inserted with review_status = draft; got: %', NEW.review_status;
+  END IF;
+  IF NEW.published_at IS NOT NULL THEN
+    RAISE EXCEPTION 'New cases cannot have published_at set on INSERT';
+  END IF;
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+-- CREATE TRIGGER enforce_cases_insert_draft BEFORE INSERT ON cases
+--   FOR EACH ROW EXECUTE FUNCTION enforce_cases_insert_draft();
 
 -- review_status state machine trigger
 -- Enforces allowed transitions; blocks illegal jumps (e.g. draft → published)
@@ -407,7 +505,7 @@ Case
 | `location_coords` | point | lat/lng |
 | `date_start` | date | |
 | `date_end` | date | nullable |
-| `year` | int | **Application-managed** (not a Postgres GENERATED ALWAYS AS column — Supabase does not reliably support generated columns on all plan tiers). Set by Agent A on insert from `EXTRACT(YEAR FROM date_start)`. Update trigger recommended: `BEFORE UPDATE ON cases` → `NEW.year = EXTRACT(YEAR FROM NEW.date_start) IF NEW.year IS NULL`. Nullable — some cold cases lack a precise date. Used for /year/1994 SEO pages. |
+| `year` | int | **Trigger-maintained** (not GENERATED ALWAYS AS — Supabase doesn't support it reliably). The `sync_case_year` trigger unconditionally sets `year = EXTRACT(YEAR FROM date_start)` on every INSERT and UPDATE where `date_start IS NOT NULL`. If `date_start IS NULL`, `year` remains NULL. **Manual year overrides are not supported** — to set a custom year, you must set `date_start` accordingly or patch via a direct admin UPDATE that bypasses the trigger (service role only, log in `moderation_actions`). Nullable — cold cases without a known date have `year = NULL`. Used for /year/1994 SEO pages. |
 | `summary` | text | |
 | `body` | text | Plain Markdown |
 | `disclaimer` | text | Shown prominently — e.g. "No one has been charged in this case." |
@@ -419,7 +517,7 @@ Case
 | `primary_weapon` | text | nullable — controlled: `firearm` · `knife` · `blunt_object` · `poison` · `strangulation` · `unknown` · `other` |
 | `review_status` | enum | NOT NULL DEFAULT `draft` — pipeline gate, see `docs/data-pipeline.md`. **Valid transitions only:** `draft→legal_review`, `legal_review→qa_review`, `legal_review→draft` (Agent B FAIL), `qa_review→approved`, `qa_review→legal_review` (Agent C vocab-only fix), `qa_review→draft` (Agent C body-rewrite needed), `approved→published`, `approved→legal_review` (source coverage gate fail — system job), `any→rejected` (admin only), `any→suppressed` (takedown), `suppressed→legal_review` (admin-initiated unsuppression only). Enforced by app layer + state machine trigger (SQL below). `rejected` = permanently blocked (admin decision, not Agent B/C FAIL). |
 | `revision_count` | int | NOT NULL DEFAULT 0 — incremented on each Agent B/C FAIL → draft cycle; escalates to human review after 3 |
-| `published_at` | timestamptz | null = draft. Never auto-set for `legal_sensitivity: high`. Must be accompanied by `review_status: published`. CHECK: `(published_at IS NULL OR review_status = 'published') AND (review_status = 'published' OR published_at IS NULL)` — prevents `published_at` being set on a draft case and prevents `review_status: published` without a timestamp. |
+| `published_at` | timestamptz | null = draft. Never auto-set for `legal_sensitivity: high`. Must be accompanied by `review_status: published`. CHECK: `((published_at IS NOT NULL) = (review_status = 'published'))` — true biconditional: `published_at` present ↔ `review_status` is `published`. Prevents both (a) `published_at` set on a draft, and (b) `review_status: published` with no timestamp. |
 | `deleted_at` | timestamptz | Soft delete. Cases are NEVER hard-deleted — destroys audit trail. Set `deleted_at` instead. RLS hides from all public queries. |
 | `created_at` | timestamptz | |
 | `updated_at` | timestamptz | |
@@ -808,7 +906,7 @@ Structured legal proceedings per person per case. `case_people.legal_status` is 
 | `created_at` | timestamptz | |
 | `updated_at` | timestamptz | |
 
-**Display note:** If a person has charges with `disposition: pending`, show "Convicted (appealing)" or "Charged (trial pending)" in the UI — not just the flat `legal_status` value.
+**Display note:** `disposition: pending` = pre-trial (charges filed, trial not yet concluded) → show "Charged (trial pending)". "Convicted (appealing)" is driven by `appeals.status = 'pending'` on a person with `legal_status: convicted` — see `appeals` display note below.
 
 ---
 
@@ -1023,7 +1121,7 @@ Kill switch. Suppressed person → renders as "[Name withheld]" site-wide. Suppr
 | `reason` | enum | NOT NULL — `legal_demand` · `court_order` · `minor_privacy` · `victim_request` · `family_request` · `editorial` |
 | `takedown_request_id` | uuid | FK → content_takedown_requests (nullable) |
 | `suppressed_by` | uuid | FK → profiles (SET NULL) — nullable; null when suppression is agent-initiated (e.g. Agent D auto-suppress) |
-| `agent_source` | text | nullable — `agent_a` · `agent_b` · `agent_c` · `agent_d` · `system` · `human`. CHECK: `(suppressed_by IS NOT NULL OR agent_source IS NOT NULL)` — same mutual non-null pattern as `moderation_actions`. |
+| `agent_source` | text | nullable — CHECK (`agent_source IN ('agent_a','agent_b','agent_c','agent_d','human','system')`). Also subject to: CHECK `(suppressed_by IS NOT NULL OR agent_source IS NOT NULL)` — same mutual non-null pattern as `moderation_actions`. |
 | `suppressed_at` | timestamptz | NOT NULL DEFAULT now() |
 | `lifted_at` | timestamptz | nullable — if suppression was later reversed |
 | `lift_reason` | text | nullable |
@@ -1041,8 +1139,8 @@ Immutable audit log of every moderation decision. Required for legal defense.
 |-------|------|-------|
 | `id` | uuid | PK |
 | `moderator_id` | uuid | FK → profiles (SET NULL) — nullable; null when action is from an automated agent |
-| `agent_source` | text | nullable — `agent_a` · `agent_b` · `agent_c` · `agent_d` · `human` · `system` (automated cron/trigger jobs). Set when `moderator_id` is null. CHECK: `(moderator_id IS NOT NULL OR agent_source IS NOT NULL)` — at least one attribution required. Prevents orphaned audit records. |
-| `entity_type` | text | NOT NULL |
+| `agent_source` | text | nullable — CHECK (`agent_source IN ('agent_a','agent_b','agent_c','agent_d','human','system')`). `system` = automated cron/trigger jobs. Set when `moderator_id` is null. Also subject to: CHECK `(moderator_id IS NOT NULL OR agent_source IS NOT NULL)` — at least one attribution required. Prevents orphaned audit records. |
+| `entity_type` | text | NOT NULL, CHECK (`entity_type IN ('cases','people','case_people','charges','appeals','community_notes','community_corrections','content_reports','suppressed_entities','content_takedown_requests')`) — constrained like all other entity_type columns; audit records with invalid entity_type are meaningless |
 | `entity_id` | uuid | NOT NULL |
 | `action_type` | enum | NOT NULL — `approved` · `rejected` · `edited` · `deleted` · `restored` · `suppressed` · `unsuppressed` · `locked` · `unlocked` |
 | `reason` | text | nullable |
@@ -1111,6 +1209,7 @@ PK: `(user_id, media_type, media_id)`
 | `sources` | `url` | UNIQUE | Citation deduplication |
 | `news_articles` | `published_at` | btree | Recent articles listing |
 | `slug_redirects` | `old_slug` | UNIQUE | Redirect lookups |
+| `slug_redirects` | `new_case_id` | btree | FK join — sync_slug_redirect trigger queries this on every case slug change |
 | `jurisdictions` | `state_code` | btree | State SEO pages |
 | `cases` | `state_code` | btree | /state/california pages |
 | `cases` | `year` | btree | /year/1994 pages |
@@ -1201,7 +1300,7 @@ SET upvote_count = (
 | 11 | Tupac Shakur | `ongoing_trial` | `high` | Duane Davis = `alleged`, active proceedings. Community features locked. Human review required. |
 | 12 | Biggie Smalls | `unsolved` | `standard` | All persons = `person_of_interest` |
 | 13 | Trayvon Martin | `solved_acquitted` | `high` | George Zimmerman = `acquitted`. Actively litigious — has sued multiple media orgs. Prominent disclaimer required. |
-| 14 | Chandra Levy | `unsolved` | `elevated` | Conviction vacated, no one currently convicted. Gary Condit sued multiple outlets. All persons = `no_charges_filed`. |
+| 14 | Chandra Levy | `unsolved` | `elevated` | Ingmar Guandique = `exonerated` (convicted 2010, conviction vacated 2016 — no retrial). Gary Condit = `no_charges_filed` (never formally accused, sued multiple outlets). High editorial care required. |
 | 15 | Elizabeth Short (Black Dahlia) | `unsolved` | `standard` | All deceased, no named charged individuals |
 | 16 | Natalee Holloway | `unsolved` | `elevated` | Van der Sloot = `person_of_interest` for this case (convicted of unrelated crime only) |
 | 17 | Etan Patz | `solved_convicted` | `standard` | Pedro Hernandez = `convicted` |
