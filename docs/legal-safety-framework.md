@@ -49,7 +49,8 @@ Every case and every person in the case must carry a legal status label. This is
 - `exonerated`
 - `alleged` (charged but not convicted)
 - `person_of_interest` (named by investigators, not charged)
-- `suspect_unnamed` (named by investigators, not charged) — if truly unnamed, omit from person records entirely
+-  — named by investigators, not formally charged
+- If truly unnamed (no identity known), omit from person records entirely
 - `witness`
 - `no_charges_filed` (named in media/podcasts, never charged)
 
