@@ -261,8 +261,12 @@ CREATE POLICY "admin_read_moderation_actions" ON moderation_actions FOR SELECT T
   USING (auth.jwt() ->> 'role' IN ('admin', 'editorial'));
 CREATE POLICY "admin_write_moderation_actions" ON moderation_actions FOR INSERT TO authenticated
   WITH CHECK (auth.jwt() ->> 'role' IN ('admin', 'editorial'));
--- Note: 'role' claim must be set in Supabase auth.users metadata and included in JWT.
--- The migration must configure this claim; it is not automatic.
+-- moderation_actions is an immutable audit log: no UPDATE or DELETE policies.
+-- RLS default-deny covers UPDATE/DELETE — intentional. If someone adds a permissive
+-- policy later, this comment serves as the guard. Do not add UPDATE/DELETE policies.
+-- CRITICAL: 'role' claim must be in raw_app_meta_data (server-only, not client-writable).
+-- Do NOT use raw_user_meta_data (user can self-modify → privilege escalation).
+-- Set via Supabase Auth Hook or admin API only. Migration must document this setup.
 
 -- REQUIRED: upvotes immutability — prevent count drift from UPDATE operations
 CREATE OR REPLACE FUNCTION block_upvote_update() RETURNS TRIGGER AS $$
@@ -272,6 +276,8 @@ END;
 $$ LANGUAGE plpgsql;
 -- CREATE TRIGGER block_upvote_update BEFORE UPDATE ON upvotes
 --   FOR EACH ROW EXECUTE FUNCTION block_upvote_update();
+-- ⚠️ REQUIRED — must be uncommented in migration. Without this, UPDATE on upvotes
+-- silently drifts upvote_count without triggering update_upvote_count.
 
 -- REQUIRED: ongoing_trial community lock — these policies MUST be in the migration
 -- community_notes INSERT: block on ongoing_trial cases
