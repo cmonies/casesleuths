@@ -240,7 +240,7 @@ After Agent C sets `review_status: approved`:
 1. A system job (cron or DB trigger) checks the minimum source coverage gate
 2. If gate passes: sets `published_at = now()`, `review_status: published`
 3. Logs to `moderation_actions` (`action_type: approved`, `agent_source: 'system'`, `reason: "auto_publish_approved"`)
-4. If gate fails: routes back to `legal_review`, increments `revision_count`
+4. If gate fails: routes back to `legal_review` (`approved → legal_review` transition), increments `revision_count`. This is a valid schema transition — documented in the `review_status` allowed transitions list.
 
 **Source coverage gate (enforced at DB level):**
 - At least 1 source in `entity_sources` linked to the case itself
@@ -269,6 +269,9 @@ For specific P0 categories, Agent D **auto-suppresses** the case (`review_status
 **DM-only categories (no auto-suppress):**
 - Any `case_people` row with `legal_status = 'convicted'` where `appeals.status = 'pending'` (display bug, not legal risk)
 - Any `is_living = true` person with no disclaimer on their case (legal risk but needs editorial judgment)
+
+#### Minor Age-Out Check — Run nightly before other checks
+Agent D checks all `people` rows where `is_minor_currently = true` and `dob IS NOT NULL`. If `CURRENT_DATE - dob >= 18 years`, sets `is_minor_currently = false` and logs to `moderation_actions` (`action_type: edited`, `agent_source: agent_d`, `metadata: { field: is_minor_currently, from: true, to: false }`). This ensures the display policy engine re-evaluates on next render. Editors must then decide whether to update `name_display_policy` from `auto` to `full` (requires human review).
 
 #### Stale Pipeline Detection (P1) — Include in nightly summary
 - Any case with `review_status IN ('legal_review', 'qa_review')` and `updated_at` older than 24 hours → **Agent B or C may have crashed** → flag for investigation

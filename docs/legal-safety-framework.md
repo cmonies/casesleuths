@@ -53,7 +53,11 @@ Every case and every person in the case must carry a legal status label. This is
 - `person_of_interest` (named by investigators, not formally charged — if truly unnamed, omit from person records)
 - `witness`
 - `charges_dropped` (was formally charged; charges subsequently dropped or dismissed before trial — distinct from acquitted and from no_charges_filed)
-- `no_charges_filed` (named in media/podcasts, never formally charged)
+- `no_charges_filed` (named in media/podcasts, never formally accused by law enforcement)
+- `detective` (investigator on the case — non-adversarial role)
+- `attorney` (defense, prosecution, or civil attorney — non-adversarial role)
+- `judge` (presiding judge — non-adversarial role)
+- `other` (any role not covered above — must include a notes field explaining the role)
 
 **UI requirement:** Person status must be visible on case pages. Never just "killer" — always "convicted of murder" or "alleged to have..." Language matters legally.
 

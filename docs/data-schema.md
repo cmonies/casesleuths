@@ -96,7 +96,8 @@ $$ LANGUAGE plpgsql;
 -- Apply to: cases, tags, people, agencies, evidence, interviews, podcasts,
 --   podcast_episodes, tv_shows, news_articles, case_faqs, case_subreddits,
 --   profiles, community_notes, community_corrections, content_reports,
---   slug_redirects, timeline_events
+--   slug_redirects, timeline_events, case_people, charges, appeals,
+--   jurisdictions, case_series, books, content_takedown_requests, sources
 
 -- Upvote count trigger (dispatches dynamically on entity_type)
 CREATE OR REPLACE FUNCTION update_upvote_count() RETURNS TRIGGER AS $$
@@ -115,6 +116,93 @@ $$ LANGUAGE plpgsql;
 -- Note: entity_type values MUST match actual table names for dynamic dispatch
 -- CREATE TRIGGER update_upvote_count AFTER INSERT OR DELETE ON upvotes
 --   FOR EACH ROW EXECUTE FUNCTION update_upvote_count();
+```
+
+```sql
+-- Source coverage publish gate trigger
+-- Blocks review_status being set to 'published' unless minimum source coverage is met
+CREATE OR REPLACE FUNCTION check_source_coverage() RETURNS TRIGGER AS $$
+BEGIN
+  IF NEW.review_status = 'published' AND OLD.review_status != 'published' THEN
+    -- Case must have at least 1 source linked directly
+    IF NOT EXISTS (
+      SELECT 1 FROM entity_sources
+      WHERE entity_type = 'cases' AND entity_id = NEW.id
+    ) THEN
+      RAISE EXCEPTION 'Cannot publish case %: no sources linked to case record', NEW.id;
+    END IF;
+    -- Every timeline_event must have at least 1 source
+    IF EXISTS (
+      SELECT 1 FROM timeline_events te
+      WHERE te.case_id = NEW.id
+      AND NOT EXISTS (
+        SELECT 1 FROM entity_sources es
+        WHERE es.entity_type = 'timeline_events' AND es.entity_id = te.id
+      )
+    ) THEN
+      RAISE EXCEPTION 'Cannot publish case %: one or more timeline_events have no source', NEW.id;
+    END IF;
+  END IF;
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+-- CREATE TRIGGER check_source_coverage BEFORE UPDATE ON cases
+--   FOR EACH ROW EXECUTE FUNCTION check_source_coverage();
+
+-- review_status state machine trigger
+-- Enforces allowed transitions; blocks illegal jumps (e.g. draft → published)
+CREATE OR REPLACE FUNCTION enforce_review_status_transition() RETURNS TRIGGER AS $$
+DECLARE
+  allowed boolean := false;
+BEGIN
+  IF OLD.review_status = NEW.review_status THEN RETURN NEW; END IF; -- no-op
+  -- Define allowed transitions
+  IF (OLD.review_status = 'draft'          AND NEW.review_status = 'legal_review')  THEN allowed := true; END IF;
+  IF (OLD.review_status = 'legal_review'   AND NEW.review_status IN ('qa_review', 'draft')) THEN allowed := true; END IF;
+  IF (OLD.review_status = 'qa_review'      AND NEW.review_status IN ('approved', 'legal_review', 'draft')) THEN allowed := true; END IF;
+  IF (OLD.review_status = 'approved'       AND NEW.review_status IN ('published', 'legal_review')) THEN allowed := true; END IF;
+  IF (NEW.review_status = 'rejected')      THEN allowed := true; END IF; -- admin-only, any→rejected
+  IF (NEW.review_status = 'suppressed')    THEN allowed := true; END IF; -- any→suppressed (takedown)
+  IF (OLD.review_status = 'suppressed'     AND NEW.review_status = 'legal_review') THEN allowed := true; END IF; -- admin unsuppression
+  IF NOT allowed THEN
+    RAISE EXCEPTION 'Invalid review_status transition: % → %', OLD.review_status, NEW.review_status;
+  END IF;
+  -- Log transition to moderation_actions (agent_source set by caller via session variable or default)
+  INSERT INTO moderation_actions (entity_type, entity_id, action_type, agent_source, metadata)
+  VALUES ('cases', NEW.id, 'edited', current_setting('app.agent_source', true),
+    jsonb_build_object('field', 'review_status', 'from', OLD.review_status, 'to', NEW.review_status));
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+-- CREATE TRIGGER enforce_review_status_transition BEFORE UPDATE ON cases
+--   FOR EACH ROW WHEN (OLD.review_status IS DISTINCT FROM NEW.review_status)
+--   EXECUTE FUNCTION enforce_review_status_transition();
+
+-- slug_redirects sync trigger
+-- When cases.slug changes, updates denormalized new_slug on all slug_redirects rows pointing to this case
+CREATE OR REPLACE FUNCTION sync_slug_redirect() RETURNS TRIGGER AS $$
+BEGIN
+  IF OLD.slug IS DISTINCT FROM NEW.slug THEN
+    UPDATE slug_redirects SET new_slug = NEW.slug WHERE new_case_id = NEW.id;
+  END IF;
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+-- CREATE TRIGGER sync_slug_redirect AFTER UPDATE ON cases
+--   FOR EACH ROW WHEN (OLD.slug IS DISTINCT FROM NEW.slug)
+--   EXECUTE FUNCTION sync_slug_redirect();
+
+-- cases.year sync trigger (application-managed — set from date_start on insert/update)
+CREATE OR REPLACE FUNCTION sync_case_year() RETURNS TRIGGER AS $$
+BEGIN
+  IF NEW.date_start IS NOT NULL THEN
+    NEW.year := EXTRACT(YEAR FROM NEW.date_start)::int;
+  END IF;
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+-- CREATE TRIGGER sync_case_year BEFORE INSERT OR UPDATE ON cases
+--   FOR EACH ROW EXECUTE FUNCTION sync_case_year();
 ```
 
 **Security note:** The dynamic SQL in the trigger uses `entity_type` as a table name. The `CHECK` constraint on `entity_type` is the sole injection guard — never remove it or allow unvalidated values in this column. For maximum safety at scale, replace with per-entity triggers (one dedicated trigger per upvotable table).
@@ -292,7 +380,7 @@ Case
 | `id` | uuid | PK, FK → auth.users (ON DELETE CASCADE) |
 | `display_name` | text | |
 | `avatar_url` | text | |
-| `app_role` | enum | `user` · `moderator` · `admin` |
+| `app_role` | enum | NOT NULL DEFAULT `user` — `user` · `moderator` · `admin` |
 | `is_banned` | bool | default false |
 | `created_at` | timestamptz | |
 | `updated_at` | timestamptz | |
@@ -329,9 +417,9 @@ Case
 | `og_image_url` | text | 1200×630 for Open Graph |
 | `number_of_victims` | int | nullable — for programmatic SEO stats pages |
 | `primary_weapon` | text | nullable — controlled: `firearm` · `knife` · `blunt_object` · `poison` · `strangulation` · `unknown` · `other` |
-| `review_status` | enum | `draft` · `legal_review` · `qa_review` · `approved` · `published` · `rejected` · `suppressed` — pipeline gate, see `docs/data-pipeline.md`. **Valid transitions only:** `draft→legal_review`, `legal_review→qa_review`, `legal_review→draft` (Agent B FAIL), `qa_review→approved`, `qa_review→legal_review` (Agent C vocab-only fix), `qa_review→draft` (Agent C body-rewrite needed), `approved→published`, `any→rejected` (admin only), `any→suppressed` (takedown). Enforced by app layer + trigger. `rejected` = permanently blocked (admin decision, not Agent B/C FAIL). |
+| `review_status` | enum | NOT NULL DEFAULT `draft` — pipeline gate, see `docs/data-pipeline.md`. **Valid transitions only:** `draft→legal_review`, `legal_review→qa_review`, `legal_review→draft` (Agent B FAIL), `qa_review→approved`, `qa_review→legal_review` (Agent C vocab-only fix), `qa_review→draft` (Agent C body-rewrite needed), `approved→published`, `approved→legal_review` (source coverage gate fail — system job), `any→rejected` (admin only), `any→suppressed` (takedown), `suppressed→legal_review` (admin-initiated unsuppression only). Enforced by app layer + state machine trigger (SQL below). `rejected` = permanently blocked (admin decision, not Agent B/C FAIL). |
 | `revision_count` | int | NOT NULL DEFAULT 0 — incremented on each Agent B/C FAIL → draft cycle; escalates to human review after 3 |
-| `published_at` | timestamptz | null = draft. Never auto-set for `legal_sensitivity: high`. Must be accompanied by `review_status: published`. |
+| `published_at` | timestamptz | null = draft. Never auto-set for `legal_sensitivity: high`. Must be accompanied by `review_status: published`. CHECK: `(published_at IS NULL OR review_status = 'published') AND (review_status = 'published' OR published_at IS NULL)` — prevents `published_at` being set on a draft case and prevents `review_status: published` without a timestamp. |
 | `deleted_at` | timestamptz | Soft delete. Cases are NEVER hard-deleted — destroys audit trail. Set `deleted_at` instead. RLS hides from all public queries. |
 | `created_at` | timestamptz | |
 | `updated_at` | timestamptz | |
@@ -356,8 +444,8 @@ Case
 | Field | Type | Notes |
 |-------|------|-------|
 | `id` | uuid | PK |
-| `slug` | text | UNIQUE |
-| `label` | text | |
+| `slug` | text | NOT NULL, UNIQUE |
+| `label` | text | NOT NULL |
 | `description` | text | |
 | `created_at` | timestamptz | |
 | `updated_at` | timestamptz | |
@@ -429,12 +517,12 @@ CONSTRAINT: `CHECK (case_id_a < case_id_b)` — prevents `(A,B)` and `(B,A)` dup
 | `slug` | text | NOT NULL, UNIQUE, URL-safe — for person SEO pages |
 | `name` | text | NOT NULL |
 | `aliases` | text[] | NOT NULL DEFAULT '{}' |
-| `primary_known_role` | enum | **Display hint only.** Source of truth is `case_people.legal_status`. Values: see legal vocabulary above. |
+| `primary_known_role` | `person_legal_status` enum | **Display hint only.** Source of truth is `case_people.legal_status`. Same enum type as `case_people.legal_status`. |
 | `dob` | date | nullable |
 | `dod` | date | nullable |
 | `bio` | text | |
 | `photo_url` | text | |
-| `is_living` | bool | nullable — null = unknown. `true` + not convicted → aggressive disclaimer required |
+| `is_living` | bool | nullable — null = unknown. `true` + not convicted → aggressive disclaimer required. CHECK: `(dod IS NULL OR is_living IS NOT TRUE)` — person cannot have a date of death and be marked living. |
 | `is_minor_at_time_of_crime` | bool | nullable — under 18 when the crime occurred |
 | `is_minor_currently` | bool | nullable — still a minor today. **Auto-update mechanism:** Agent D nightly cron checks all `people` rows where `is_minor_currently = true` and `dob IS NOT NULL`; if `CURRENT_DATE - dob >= 18 years`, sets `is_minor_currently = false` and logs a `moderation_actions` record (`action_type: edited`, `agent_source: agent_d`, `metadata: { "field": "is_minor_currently", "from": true, "to": false }`). Editors can override by setting explicit `name_display_policy` + `photo_display_policy` values (not `auto`). |
 | `name_display_policy` | enum | `full` · `initials_only` · `redacted` · `auto` — default `auto` (enforces minor display rules) |
@@ -473,8 +561,8 @@ UNIQUE: `(case_id, person_id)` — **one row per person per case**. `legal_statu
 | Field | Type | Notes |
 |-------|------|-------|
 | `id` | uuid | PK |
-| `slug` | text | UNIQUE, URL-safe |
-| `name` | text | |
+| `slug` | text | NOT NULL, UNIQUE, URL-safe |
+| `name` | text | NOT NULL |
 | `type` | enum | `local_pd` · `sheriff` · `fbi` · `da` · `state_police` · `other` _(US-centric v1 — known tech debt)_ |
 | `jurisdiction` | text | |
 | `contact_url` | text | |
@@ -906,7 +994,7 @@ All takedown/erasure/legal requests must be logged here — never handle informa
 |-------|------|-------|
 | `id` | uuid | PK |
 | `request_type` | enum | `legal_demand` · `family_request` · `subject_request` · `minor_aged_out` · `victim_privacy` · `court_order` · `dmca` |
-| `entity_type` | text | What is being requested for removal |
+| `entity_type` | text | CHECK (`entity_type IN ('cases','people','timeline_events','evidence','community_notes','community_corrections')`) — what is being requested for removal |
 | `entity_id` | uuid | |
 | `requester_name` | text | nullable |
 | `requester_email` | text | nullable |
@@ -934,7 +1022,8 @@ Kill switch. Suppressed person → renders as "[Name withheld]" site-wide. Suppr
 | `entity_id` | uuid | NOT NULL |
 | `reason` | enum | NOT NULL — `legal_demand` · `court_order` · `minor_privacy` · `victim_request` · `family_request` · `editorial` |
 | `takedown_request_id` | uuid | FK → content_takedown_requests (nullable) |
-| `suppressed_by` | uuid | FK → profiles (NOT NULL) |
+| `suppressed_by` | uuid | FK → profiles (SET NULL) — nullable; null when suppression is agent-initiated (e.g. Agent D auto-suppress) |
+| `agent_source` | text | nullable — `agent_a` · `agent_b` · `agent_c` · `agent_d` · `system` · `human`. CHECK: `(suppressed_by IS NOT NULL OR agent_source IS NOT NULL)` — same mutual non-null pattern as `moderation_actions`. |
 | `suppressed_at` | timestamptz | NOT NULL DEFAULT now() |
 | `lifted_at` | timestamptz | nullable — if suppression was later reversed |
 | `lift_reason` | text | nullable |
