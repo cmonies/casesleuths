@@ -249,7 +249,13 @@ GRANT SELECT ON public_people TO authenticated;  -- editorial/admin tools only
 -- Note: service_role always bypasses RLS (for agents + server-side code).
 CREATE POLICY "admin_read_suppressed_entities" ON suppressed_entities FOR SELECT TO authenticated
   USING (auth.jwt() ->> 'role' IN ('admin', 'editorial'));
-CREATE POLICY "admin_write_suppressed_entities" ON suppressed_entities FOR ALL TO authenticated
+-- Split per-command: FOR ALL with USING only ignores USING on INSERT, allowing non-admin inserts
+CREATE POLICY "admin_insert_suppressed_entities" ON suppressed_entities FOR INSERT TO authenticated
+  WITH CHECK (auth.jwt() ->> 'role' IN ('admin', 'editorial'));
+CREATE POLICY "admin_update_suppressed_entities" ON suppressed_entities FOR UPDATE TO authenticated
+  USING (auth.jwt() ->> 'role' IN ('admin', 'editorial'))
+  WITH CHECK (auth.jwt() ->> 'role' IN ('admin', 'editorial'));
+CREATE POLICY "admin_delete_suppressed_entities" ON suppressed_entities FOR DELETE TO authenticated
   USING (auth.jwt() ->> 'role' IN ('admin', 'editorial'));
 CREATE POLICY "admin_read_moderation_actions" ON moderation_actions FOR SELECT TO authenticated
   USING (auth.jwt() ->> 'role' IN ('admin', 'editorial'));
@@ -303,6 +309,25 @@ CREATE POLICY "block_ongoing_trial_notes_update" ON community_notes FOR UPDATE T
 CREATE POLICY "block_ongoing_trial_corrections_update" ON community_corrections FOR UPDATE TO authenticated
   USING (
     NOT EXISTS (SELECT 1 FROM cases WHERE id = community_corrections.case_id AND status = 'ongoing_trial')
+  );
+-- DELETE policies: also block deletion (removing content during active trial = mutation)
+CREATE POLICY "block_ongoing_trial_notes_delete" ON community_notes FOR DELETE TO authenticated
+  USING (
+    NOT EXISTS (SELECT 1 FROM cases WHERE id = community_notes.case_id AND status = 'ongoing_trial')
+  );
+CREATE POLICY "block_ongoing_trial_corrections_delete" ON community_corrections FOR DELETE TO authenticated
+  USING (
+    NOT EXISTS (SELECT 1 FROM cases WHERE id = community_corrections.case_id AND status = 'ongoing_trial')
+  );
+CREATE POLICY "block_ongoing_trial_upvotes_delete" ON upvotes FOR DELETE TO authenticated
+  USING (
+    NOT EXISTS (
+      SELECT 1 FROM community_notes cn
+      JOIN cases c ON c.id = cn.case_id
+      WHERE cn.id = upvotes.entity_id
+        AND upvotes.entity_type = 'community_notes'
+        AND c.status = 'ongoing_trial'
+    )
   );
 
 Note: The above ongoing_trial lock policies are REQUIRED in the migration — this is an explicit legal safety rule. The remaining full RLS policy set (auth reads for community tables, content_reports) is written in the migration file. The key rule is NO direct anon access to base tables.
@@ -431,7 +456,8 @@ CREATE OR REPLACE FUNCTION update_upvote_count() RETURNS TRIGGER AS $$
 BEGIN
   IF TG_OP = 'INSERT' THEN
     IF NEW.entity_type = 'community_notes' THEN
-      UPDATE community_notes SET upvote_count = upvote_count + 1 WHERE id = NEW.entity_id;
+      UPDATE community_notes SET upvote_count = GREATEST(upvote_count + 1, 0) WHERE id = NEW.entity_id;
+      -- GREATEST on INSERT: defends against corrupt negative baseline (bad import, manual SQL)
     -- community_corrections is NOT in MVP upvote scope — no upvote_count column on that table yet.
     -- To extend: (1) add upvote_count to community_corrections, (2) add to entity_type CHECK,
     -- (3) add ELSIF branch here for both INSERT and DELETE cases.
