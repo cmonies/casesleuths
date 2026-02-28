@@ -288,6 +288,8 @@ WHERE se_case.id IS NULL; -- exclude suppressed cases entirely
 
 **Drift insurance:** Nightly reconciliation cron recomputes all `upvote_count` values from the `upvotes` table directly — cheap insurance against trigger edge cases (manual SQL, pg_restore, bulk imports).
 
+⚠️ **All `-- CREATE TRIGGER` statements below are REQUIRED in the migration.** They are commented out in this spec to prevent confusion with Postgres syntax highlighting, but every one must be uncommented and executed in the migration SQL. Missing any trigger silently breaks the corresponding safety guarantee (source coverage, high-sensitivity gate, insert guard, etc.). See migration order note at top of Enum Definitions section.
+
 ```sql
 -- updated_at auto-trigger template (apply to every table with updated_at)
 CREATE OR REPLACE FUNCTION set_updated_at() RETURNS TRIGGER AS $$
@@ -339,7 +341,10 @@ $$ LANGUAGE plpgsql;
 
 ```sql
 -- legal_sensitivity: high publish block trigger
--- Prevents auto-publish of high-sensitivity cases without a human approval record
+-- MIGRATION DEPENDENCY: this function must be created AFTER the moderation_actions table exists.
+-- Migration order: CREATE TABLE moderation_actions → CREATE FUNCTION block_high_sensitivity_autopublish
+-- (plpgsql resolves table names at runtime, not compile time, but the SELECT inside will error
+-- on first publish attempt if moderation_actions doesn't exist — so enforce order explicitly.)
 CREATE OR REPLACE FUNCTION block_high_sensitivity_autopublish() RETURNS TRIGGER AS $$
 BEGIN
   IF NEW.review_status = 'published'
@@ -746,7 +751,7 @@ Case
 | `date_end` | date | nullable |
 | `year` | int | **Trigger-maintained** (not GENERATED ALWAYS AS — Supabase doesn't support it reliably). The `sync_case_year` trigger unconditionally sets `year = EXTRACT(YEAR FROM date_start)` on every INSERT and UPDATE where `date_start IS NOT NULL`. If `date_start IS NULL`, `year` remains NULL. **Manual year overrides are not supported** — to set a custom year, you must set `date_start` accordingly or patch via a direct admin UPDATE that bypasses the trigger (service role only, log in `moderation_actions`). Nullable — cold cases without a known date have `year = NULL`. Used for /year/1994 SEO pages. |
 | `summary` | text | |
-| `body` | text | NOT NULL. CHECK (`length(trim(body)) > 0`) — empty body forbidden. Agent A must write ≥ 500 words; checked by Agent B, not enforced at DB level (word count is too complex for a CHECK). |
+| `body` | text | NOT NULL. CHECK (`length(trim(body)) > 0`) — empty body forbidden; even draft stubs must have at least placeholder text. Agent A writes ≥ 500 words minimum; Agent B enforces word count (too complex for a DB CHECK). **Draft minimum:** a single-sentence placeholder is sufficient for `review_status = 'draft'` — the DB only enforces non-empty, not minimum length. |
 | `disclaimer` | text | Shown prominently — e.g. "No one has been charged in this case." CHECK (`disclaimer IS NULL OR length(trim(disclaimer)) > 0`) — if set, cannot be blank string. |
 | `seo_title` | text | |
 | `seo_description` | text | |
@@ -839,7 +844,7 @@ Query pattern: `WHERE case_id_a = X OR case_id_b = X`.
 | `event_type` | enum | `crime_event` · `discovery` · `arrest` · `indictment` · `trial_start` · `verdict` · `sentencing` · `appeal_filed` · `appeal_ruling` · `release` · `death` · `media_coverage` · `other` |
 | `title` | text | |
 | `description` | text | |
-| `source_url` | text | **Legacy citation shortcut** — quick single-source field for Agent A data entry. Must correspond to a `sources.url` value linked via `entity_sources` before publish. The source coverage gate checks `entity_sources`, not this field. If `source_url` is set, Agent B must verify a matching `entity_sources` record exists — mismatches are flagged as P1. Do not rely on `source_url` alone; it is not part of the audit-trail citation model. |
+| `source_url` | text | **Legacy citation shortcut** — quick single-source field for Agent A data entry. **Not DB-enforced against `sources.url`** (no FK possible — `source_url` is free text, `sources.url` is UNIQUE but separate table). Agent B must verify: if `source_url` is set, a matching `sources.url` row must exist AND a corresponding `entity_sources` record must link it. Mismatches are flagged as P1 in the Agent B violation log. The source coverage publish gate checks `entity_sources` counts only — `source_url` has no role in the gate. This field is a data-entry convenience, not part of the canonical citation trail. |
 | `media_url` | text | Optional image/doc |
 | `event_tags` | text[] | **Intentionally denormalized** — local timeline filtering only, not browsable on tag pages |
 | `sort_order` | int | |
@@ -904,7 +909,7 @@ UNIQUE: `(case_id, person_id)` — **one row per person per case**. `legal_statu
 | `id` | uuid | PK |
 | `slug` | text | NOT NULL, UNIQUE, URL-safe. CHECK (`slug ~ '^[a-z0-9]+(-[a-z0-9]+)*$'`). |
 | `name` | text | NOT NULL |
-| `type` | enum | `local_pd` · `sheriff` · `fbi` · `da` · `state_police` · `other` _(US-centric v1 — known tech debt)_ |
+| `type` | `agency_type` enum | `local_pd` · `sheriff` · `fbi` · `da` · `state_police` · `other` _(US-centric v1 — known tech debt)_ |
 | `jurisdiction` | text | |
 | `contact_url` | text | |
 | `created_at` | timestamptz | |
