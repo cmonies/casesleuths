@@ -191,6 +191,11 @@ WHERE c.deleted_at IS NULL;
 -- if you want clean redirect chains (old_slug → new_slug before checking suppression).
 
 -- public_cases: hides soft-deleted and suppressed cases from public queries
+-- KNOWN LIMITATION: cases.body/title/summary/seo_* may still name suppressed persons or
+-- persons whose name should be withheld. DB cannot scan free-text for names at publish time.
+-- Mitigation: Agent B/D must scan body text for suppressed person names before publish,
+-- and re-scan when a person is suppressed post-publish (triggering ISR revalidation).
+-- This is a product-layer responsibility, not a schema constraint. Accept the limitation.
 CREATE OR REPLACE VIEW public_cases WITH (security_barrier = true) AS
 SELECT c.*
 FROM cases c
@@ -237,6 +242,21 @@ GRANT SELECT ON public_case_people TO anon, authenticated;
 GRANT SELECT ON public_case_tombstones TO anon, authenticated;
 -- public_people is ADMIN/EDITORIAL only — do NOT grant to anon
 GRANT SELECT ON public_people TO authenticated;  -- editorial/admin tools only
+
+-- REQUIRED: admin-table RLS policies — authenticated editorial/admin users need access
+-- to suppressed_entities and moderation_actions for dashboard tooling.
+-- Without these, authenticated (non-service-role) admin users are hard-blocked.
+-- Note: service_role always bypasses RLS (for agents + server-side code).
+CREATE POLICY "admin_read_suppressed_entities" ON suppressed_entities FOR SELECT TO authenticated
+  USING (auth.jwt() ->> 'role' IN ('admin', 'editorial'));
+CREATE POLICY "admin_write_suppressed_entities" ON suppressed_entities FOR ALL TO authenticated
+  USING (auth.jwt() ->> 'role' IN ('admin', 'editorial'));
+CREATE POLICY "admin_read_moderation_actions" ON moderation_actions FOR SELECT TO authenticated
+  USING (auth.jwt() ->> 'role' IN ('admin', 'editorial'));
+CREATE POLICY "admin_write_moderation_actions" ON moderation_actions FOR INSERT TO authenticated
+  WITH CHECK (auth.jwt() ->> 'role' IN ('admin', 'editorial'));
+-- Note: 'role' claim must be set in Supabase auth.users metadata and included in JWT.
+-- The migration must configure this claim; it is not automatic.
 
 -- REQUIRED: upvotes immutability — prevent count drift from UPDATE operations
 CREATE OR REPLACE FUNCTION block_upvote_update() RETURNS TRIGGER AS $$
